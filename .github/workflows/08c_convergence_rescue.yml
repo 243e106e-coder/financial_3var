@@ -1,0 +1,406 @@
+name: Financial 3var TVP convergence rescue 5-country long-chain
+
+on:
+  workflow_dispatch:
+    inputs:
+      burn_per_chain:
+        description: "Long-chain rescue burn-in per chain"
+        required: true
+        default: "10000"
+        type: string
+      postburn_per_chain:
+        description: "Long-chain rescue post-burn iterations per chain"
+        required: true
+        default: "20000"
+        type: string
+      stored_per_chain:
+        description: "Strictly post-burn draws stored per chain"
+        required: true
+        default: "3000"
+        type: string
+      max_parallel:
+        description: "Maximum simultaneous country-chain jobs"
+        required: true
+        default: "10"
+        type: string
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Verify rescue scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            "R/00_config.R"
+            "R/10_build_financial_3var_input.R"
+            "R/15_variable_transformation_audit.R"
+            "R/20_weight_preflight.R"
+            "R/30_stability_grid.R"
+            "R/40_estimation_gate.R"
+            "R/53_event_calendar.R"
+            "R/54_build_tvp_irf_targets.R"
+            "R/60_formal_bayesian_tvp_gvar.R"
+            "R/61c_convergence_rescue_diagnostics.R"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing required file: $f"
+              exit 1
+            }
+          done
+
+      - name: Fetch validated source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+          git -C source_repo sparse-checkout set 8.12
+
+          required=(
+            "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx"
+            "source_repo/8.12/gpr_quarterly_processed.csv"
+            "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv"
+            "source_repo/8.12/Trade_Weights_14_Economies_2000_2014.csv"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing source input: $f"
+              exit 1
+            }
+          done
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install prepare-stage dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+            any::urca
+
+      - name: Build clean 3-variable panel
+        run: Rscript --vanilla R/10_build_financial_3var_input.R
+
+      - name: Audit variable transformations
+        run: Rscript --vanilla R/15_variable_transformation_audit.R
+
+      - name: Validate financial weights
+        run: Rscript --vanilla R/20_weight_preflight.R
+
+      - name: Reconfirm static p1 q1 stability
+        run: Rscript --vanilla R/30_stability_grid.R
+
+      - name: Reconfirm static estimation gate
+        run: Rscript --vanilla R/40_estimation_gate.R
+
+      - name: Build event calendar
+        run: Rscript --vanilla R/53_event_calendar.R
+
+      - name: Build TVP-IRF target grid
+        run: Rscript --vanilla R/54_build_tvp_irf_targets.R
+
+      - name: Enforce pre-rescue gates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            tg <- read.csv(
+              "results/variable_transform/11_transformation_integrity_gate.csv",
+              stringsAsFactors=FALSE
+            )
+            eg <- read.csv(
+              "results/gate/01_estimation_gate.csv",
+              stringsAsFactors=FALSE
+            )
+            ev <- read.csv(
+              "results/events/00_event_calendar.csv",
+              stringsAsFactors=FALSE
+            )
+
+            if (!all(tg$Pass)) stop("Transformation integrity gate failed.")
+            if (nrow(eg) != 1L || eg$Status[1] != "READY") {
+              stop("Static estimation gate is not READY.")
+            }
+            if (!all(ev$EventWindowReady)) stop("Event-window gate failed.")
+
+            cat("PRE-RESCUE GATES: READY\n")
+          '
+
+      - name: Upload rescue input artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-rescue-input-${{ github.run_id }}
+          path: |
+            data/derived/
+            results/variable_transform/
+            results/preflight/
+            results/stability/
+            results/gate/
+            results/events/
+          if-no-files-found: error
+          retention-days: 30
+
+  estimate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        country: [US, CN, JP, CH, TR]
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: "20260910"
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-7"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download prepared rescue inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-rescue-input-${{ github.run_id }}
+          path: .
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp from clean Linux source build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          rm -rf threshtvp_src
+
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          ACTUAL_SHA="$(git -C threshtvp_src rev-parse HEAD)"
+          echo "Requested threshtvp SHA: ${THRESHTVP_SHA}"
+          echo "Checked-out threshtvp SHA: ${ACTUAL_SHA}"
+
+          test "${ACTUAL_SHA}" = "${THRESHTVP_SHA}" || {
+            echo "::error::threshtvp checkout SHA mismatch."
+            exit 1
+          }
+
+          test -f threshtvp_src/DESCRIPTION || {
+            echo "::error::threshtvp DESCRIPTION missing after checkout."
+            exit 1
+          }
+
+          echo "=== Removing upstream precompiled build products ==="
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -print -exec file {} \; || true
+
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+          Rscript --vanilla -e '
+            stopifnot(requireNamespace("threshtvp", quietly=TRUE))
+            pkg <- find.package("threshtvp")
+            so <- list.files(
+              file.path(pkg, "libs"),
+              pattern="threshtvp[.]so$",
+              recursive=TRUE,
+              full.names=TRUE
+            )
+            if (length(so) != 1L) {
+              stop("Expected one installed threshtvp.so; found ", length(so))
+            }
+            writeLines(so, "threshtvp_installed_so_path.txt")
+            cat("threshtvp version:",
+                as.character(utils::packageVersion("threshtvp")), "\n")
+            cat("installed shared object:", so, "\n")
+          '
+
+          SO_PATH="$(cat threshtvp_installed_so_path.txt)"
+          file "${SO_PATH}"
+
+          file "${SO_PATH}" | grep -q 'ELF' || {
+            echo "::error::Newly compiled threshtvp.so is not Linux ELF."
+            exit 1
+          }
+
+      - name: Run long-chain convergence rescue MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Country=${FIN3_COUNTRY}"
+          echo "Chain=${FIN3_CHAIN_ID}"
+          echo "Burn=${FIN3_BURN}"
+          echo "Postburn=${FIN3_KEEP}"
+          echo "Stored=${FIN3_STORED_PER_CHAIN}"
+
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Upload rescue posterior part
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-rescue-part-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: |
+            results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  diagnose:
+    needs: [prepare, estimate]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_RESCUE_COUNTRIES: "US,CN,JP,CH,TR"
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download all rescue posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-rescue-part-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: true
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Run subset long-chain convergence diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61c_convergence_rescue_diagnostics.R
+
+      - name: Show convergence rescue decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== RESCUE GATE ==="
+          test -f results/convergence_rescue/00_rescue_convergence_gate.csv && \
+            cat results/convergence_rescue/00_rescue_convergence_gate.csv || true
+
+          echo
+          echo "=== COUNTRY SUMMARY ==="
+          test -f results/convergence_rescue/02_rescue_country_summary.csv && \
+            cat results/convergence_rescue/02_rescue_country_summary.csv || true
+
+          echo
+          echo "=== FAMILY SUMMARY ==="
+          test -f results/convergence_rescue/03_rescue_family_summary.csv && \
+            cat results/convergence_rescue/03_rescue_family_summary.csv || true
+
+          echo
+          echo "=== README ==="
+          test -f results/convergence_rescue/README_convergence_rescue.txt && \
+            cat results/convergence_rescue/README_convergence_rescue.txt || true
+
+      - name: Annotate rescue status without forcing a statistical pass
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if test -f results/convergence_rescue/00_rescue_convergence_gate.csv; then
+            STATUS="$(
+              Rscript --vanilla -e '
+                g <- read.csv(
+                  "results/convergence_rescue/00_rescue_convergence_gate.csv",
+                  stringsAsFactors=FALSE
+                )
+                cat(g$Status[1])
+              '
+            )"
+
+            if [ "${STATUS}" = "LONG_CHAIN_RESCUE_PASSED" ]; then
+              echo "::notice::Long-chain convergence rescue passed for US,CN,JP,CH,TR."
+            else
+              echo "::warning::Convergence rescue diagnostic status: ${STATUS}. See artifact before changing the model."
+            fi
+          fi
+
+      - name: Upload convergence rescue artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-convergence-rescue-${{ github.run_id }}
+          path: |
+            results/convergence_rescue/
+          if-no-files-found: error
+          retention-days: 30
