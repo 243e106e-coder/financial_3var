@@ -53,16 +53,34 @@ col_issuer <- pick(c("Issuer"),"Issuer")
 col_residency <- pick(c("Position_Residency","PositionResidence"),"Position Residency")
 col_restated <- pick(c("Restatement_Ex_Domestic","RestatementExDomestic"),"Restatement Ex Domestic")
 
+# Stata stores several GCAP identifiers as labelled numeric variables.  Pandas
+# decodes those labels automatically, whereas haven keeps the underlying codes
+# unless as_factor() is called.  Filtering as.character(labelled_vector) would
+# therefore compare "1" with "Fund Holdings" and return zero rows.
+label_text <- function(x) {
+  if (inherits(x,"haven_labelled") || inherits(x,"labelled")) {
+    return(as.character(haven::as_factor(x,levels="default")))
+  }
+  as.character(x)
+}
+value_key <- function(x) gsub("[^a-z0-9]","",tolower(trimws(label_text(x))))
+
 d <- data.frame(
-  methodology=trimws(as.character(raw[[col_method]])),
+  methodology_key=value_key(raw[[col_method]]),
+  methodology_label=trimws(label_text(raw[[col_method]])),
   year=as.integer(raw[[col_year]]),
-  investor=toupper(trimws(as.character(raw[[col_investor]]))),
-  asset=toupper(trimws(as.character(raw[[col_asset]]))),
-  issuer=toupper(trimws(as.character(raw[[col_issuer]]))),
+  investor=toupper(trimws(label_text(raw[[col_investor]]))),
+  asset=toupper(trimws(label_text(raw[[col_asset]]))),
+  issuer=toupper(trimws(label_text(raw[[col_issuer]]))),
   residency=num(raw[[col_residency]]),
   restated=num(raw[[col_restated]]),
   stringsAsFactors=FALSE
 )
+
+schema_audit <- unique(d[,c("methodology_key","methodology_label","year","investor","asset")])
+schema_audit <- schema_audit[order(schema_audit$year,schema_audit$investor,
+                                   schema_audit$methodology_key,schema_audit$asset),]
+write.csv(schema_audit,file.path(OUT,"00_detected_gcap_categories.csv"),row.names=FALSE)
 
 investor_map <- c(AU="AUS",BR="BRA",CA="CAN",CH="CHE",CN="CHN",EA="EMU",
                   UK="GBR",JP="JPN",KR="KOR",NO="NOR",SG="SGP",TR="TUR",
@@ -73,8 +91,10 @@ issuer_map <- lapply(investor_map,function(x)x)
 issuer_map$EA <- ea19
 fund_investors <- c("AUS","CAN","CHE","EMU","GBR","NOR","USA")
 
-methods <- setNames(ifelse(investor_map %in% fund_investors,"Fund Holdings","Issuance"),
-                    names(investor_map))
+method_keys <- setNames(ifelse(investor_map %in% fund_investors,"fundholdings","issuance"),
+                        names(investor_map))
+method_labels <- setNames(ifelse(investor_map %in% fund_investors,"Fund Holdings","Issuance"),
+                          names(investor_map))
 assets <- lapply(names(investor_map),function(cc) {
   if (cc=="US") c("E","BC","BG","BSF") else c("EF","B")
 })
@@ -88,9 +108,19 @@ F <- lapply(positions,function(x) matrix(NA_real_,length(COUNTRIES),length(COUNT
 coverage <- list()
 
 for (i in COUNTRIES) {
-  iso <- investor_map[[i]]; method <- methods[[i]]; req <- assets[[i]]
-  zi <- d[d$year==YEAR & d$investor==iso & d$methodology==method & d$asset %in% req,,drop=FALSE]
-  if (!nrow(zi)) stopf("No GCAP rows for %s/%s/%d",i,method,YEAR)
+  iso <- investor_map[[i]]; method_key <- method_keys[[i]]
+  method <- method_labels[[i]]; req <- assets[[i]]
+  zi <- d[d$year==YEAR & d$investor==iso &
+          d$methodology_key==method_key & d$asset %in% req,,drop=FALSE]
+  if (!nrow(zi)) {
+    available <- unique(d[d$year==YEAR & d$investor==iso,
+                          c("methodology_label","methodology_key","asset"),drop=FALSE])
+    detail <- if (nrow(available)) {
+      paste(apply(available,1,paste,collapse="/"),collapse=", ")
+    } else "none"
+    stopf("No GCAP rows for %s/%s/%d. Detected for investor %s: %s. See %s",
+          i,method,YEAR,iso,detail,file.path(OUT,"00_detected_gcap_categories.csv"))
+  }
   if (!setequal(unique(zi$asset),req)) stopf("Asset-class coverage is incomplete for %s",i)
   coverage[[i]] <- data.frame(
     Country=i,InvestorISO=iso,Year=YEAR,Methodology=method,
