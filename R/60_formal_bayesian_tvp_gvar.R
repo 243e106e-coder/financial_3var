@@ -468,7 +468,13 @@ for (eq in seq_len(K)) {
   # Keep hyperparameters plus representative event-date coefficients.
   # ---------------------------------------------------------------------------
 
-  mon <- data.frame(stringsAsFactors = FALSE)
+  # Preallocate the monitor data frame with the exact posterior draw count.
+  # A zero-row data.frame cannot accept a vector of length STORED_PER_CHAIN.
+  # The temporary index column is removed after all monitored parameters are added.
+  mon <- data.frame(
+    .draw_index = seq_len(STORED_PER_CHAIN),
+    stringsAsFactors = FALSE
+  )
 
   svp <- post$svparms[keep_draw, , drop = FALSE]
   if (ncol(svp) >= 3L) {
@@ -524,6 +530,16 @@ for (eq in seq_len(K)) {
       vals <- y_scale * Astd[, tt, jj] / x_scale[jj]
       mon[[paste0(eq_name, "__coef__", qq, "__", nm)]] <- vals
     }
+  }
+
+  # Drop the temporary row-allocation column before the block is retained.
+  mon$.draw_index <- NULL
+
+  if (nrow(mon) != STORED_PER_CHAIN) {
+    stopf(
+      "Monitor block has unexpected row count for %s/%s: got %d, expected %d",
+      COUNTRY, eq_name, nrow(mon), STORED_PER_CHAIN
+    )
   }
 
   monitor_blocks[[eq]] <- mon
