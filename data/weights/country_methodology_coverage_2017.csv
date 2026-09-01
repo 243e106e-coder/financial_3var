@@ -1,0 +1,15 @@
+Country,ISO3_or_Group,Country_Name,Year,Selected_Methodology,Methodology_Status,Asset_Class_Codes,Selected_Source_Rows,Selected_Source_Issuers,Restated_NA_Count,Residency_NA_Count,Sample_13_Partners_USD_mn,Global_Foreign_USD_mn,Sample_Capture_Ratio,Our_Imputation,Important_Note
+AU,AUS,Australia,2017,Fund Holdings,investor-specific fund holdings,EF+B,484,242,0,0,660429.1443206824,992718.9720374871,0.6652730157510712,none,Australia may use June if December is unavailable
+BR,BRA,Brazil,2017,Issuance,published GCAP issuance-method fallback,EF+B,484,242,0,0,29855.460337218472,40136.745930599805,0.7438435689041997,none,
+CA,CAN,Canada,2017,Fund Holdings,investor-specific fund holdings,EF+B,484,242,0,0,1556770.1077622268,1685299.4782987633,0.9237349965441861,none,
+CH,CHE,Switzerland,2017,Fund Holdings,investor-specific fund holdings,EF+B,484,242,0,0,1214329.6822280004,1374097.13909709,0.8837291394303667,none,
+CN,CHN,China,2017,Issuance,published GCAP issuance-method fallback,EF+B,484,242,0,0,275953.02054344886,370221.3693867873,0.7453730210131335,none,
+EA,EMU,European Monetary Union,2017,Fund Holdings,investor-specific fund holdings,EF+B,484,242,1,1,7725908.802309686,10160009.165645503,0.7604234087143986,none,EMU issuer is sum of 19 euro-area members; censored member positions may remain under-covered
+UK,GBR,United Kingdom,2017,Fund Holdings,investor-specific fund holdings,EF+B,484,242,0,0,2936667.4916742104,3536838.839552694,0.830308539601316,none,
+JP,JPN,Japan,2017,Issuance,published GCAP issuance-method fallback,EF+B,484,242,0,0,3640354.1489420705,4088111.5452483105,0.8904732927782568,none,
+KR,KOR,"Korea, Republic of",2017,Issuance,published GCAP issuance-method fallback,EF+B,484,242,0,0,382118.5283146886,424494.0995506728,0.9001739452189352,none,
+NO,NOR,Norway,2017,Fund Holdings,investor-specific fund holdings,EF+B,484,242,0,0,1064739.6937923133,1242198.751298638,0.8571411721990521,none,
+SG,SGP,Singapore,2017,Issuance,published GCAP issuance-method fallback,EF+B,484,242,0,0,810950.6587966846,1260750.9138599215,0.6432282934571698,none,
+TR,TUR,Turkey,2017,Issuance,published GCAP issuance-method fallback,EF+B,484,242,0,0,739.5574938823974,1151.582877748292,0.6422095258384405,none,
+US,USA,United States,2017,Fund Holdings,investor-specific fund holdings,E+BC+BG+BSF,968,242,0,0,8140889.447894838,9936736.784225438,0.8192719224301577,none,
+ZA,ZAF,South Africa,2017,Issuance,published GCAP issuance-method fallback,EF+B,484,242,0,0,168554.89302416262,181672.13469654034,0.9277971732192812,none,
