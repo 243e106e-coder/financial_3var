@@ -1,0 +1,104 @@
+name: Financial 3var event calendar and TVP-IRF targets
+
+on:
+  workflow_dispatch:
+
+jobs:
+  event-calendar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Fetch validated source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+          git -C source_repo sparse-checkout set 8.12
+
+          test -f "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx" \
+            || { echo "::error::Missing macro workbook"; exit 1; }
+          test -f "source_repo/8.12/gpr_quarterly_processed.csv" \
+            || { echo "::error::Missing GPR file"; exit 1; }
+          test -f "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv" \
+            || { echo "::error::Missing Brent file"; exit 1; }
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install input dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+
+      - name: Build clean financial 3-variable panel
+        run: Rscript --vanilla R/10_build_financial_3var_input.R
+
+      - name: Build audited event calendar
+        run: Rscript --vanilla R/53_event_calendar.R
+
+      - name: Build formal TVP-IRF target grid
+        run: Rscript --vanilla R/54_build_tvp_irf_targets.R
+
+      - name: Show event audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== EVENT CALENDAR README ==="
+          cat results/events/README_event_calendar.txt
+
+          echo
+          echo "=== SAMPLE AUDIT ==="
+          cat results/events/03_event_sample_audit.csv
+
+          echo
+          echo "=== PAPER EVENT TABLE ==="
+          cat results/events/04_paper_event_table.csv
+
+          echo
+          echo "=== IRF TARGET SUMMARY ==="
+          cat results/events/10_irf_target_summary.csv
+
+      - name: Enforce event-window validity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            d <- read.csv(
+              "results/events/00_event_calendar.csv",
+              stringsAsFactors = FALSE,
+              check.names = FALSE
+            )
+            if (!all(d$EventWindowReady)) {
+              bad <- paste(d$EventID[!d$EventWindowReady], collapse=", ")
+              stop(paste("Invalid event windows:", bad))
+            }
+            if (sum(d$EventSet == "CORE") != 6L) {
+              stop("Expected exactly 6 core events.")
+            }
+            if (sum(d$EventSet == "APPENDIX") != 4L) {
+              stop("Expected exactly 4 appendix events.")
+            }
+            cat("EVENT CALENDAR: READY_FOR_FORMAL_TVP_IRF\n")
+          '
+
+      - name: Upload event-calendar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-event-calendar-${{ github.run_id }}
+          path: |
+            data/derived/panel_domestic_fin3.csv
+            results/events/
+          if-no-files-found: error
+          retention-days: 30
