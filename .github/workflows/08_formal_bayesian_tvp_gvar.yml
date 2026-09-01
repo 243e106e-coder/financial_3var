@@ -239,37 +239,48 @@ jobs:
             any::MASS
             any::dlm
             any::snowfall
-            any::remotes
 
-      - name: Install pinned threshtvp
+      - name: Install pinned threshtvp without GitHub API
         shell: bash
         run: |
           set -euo pipefail
 
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          rm -rf threshtvp_src
+
+          # Do not use remotes::install_github() here. That route first queries
+          # api.github.com/.../contents/DESCRIPTION?ref=<sha>, which can fail
+          # independently of git access. Clone the repository and checkout the
+          # exact reproducibility commit instead.
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          ACTUAL_SHA="$(git -C threshtvp_src rev-parse HEAD)"
+          echo "Requested threshtvp SHA: ${THRESHTVP_SHA}"
+          echo "Checked-out threshtvp SHA: ${ACTUAL_SHA}"
+
+          test "${ACTUAL_SHA}" = "${THRESHTVP_SHA}" || {
+            echo "::error::threshtvp checkout SHA mismatch."
+            exit 1
+          }
+
+          test -f threshtvp_src/DESCRIPTION || {
+            echo "::error::threshtvp DESCRIPTION missing after git checkout."
+            exit 1
+          }
+
+          R CMD INSTALL --no-multiarch --with-keep.source threshtvp_src
+
           Rscript --vanilla -e '
-            sha <- "c0133f262fcf0f935805168f8b7def02b43dc6d5"
-            need_install <- TRUE
-
-            if (requireNamespace("threshtvp", quietly=TRUE)) {
-              d <- utils::packageDescription("threshtvp")
-              rs <- if (!is.null(d$RemoteSha)) as.character(d$RemoteSha) else ""
-              need_install <- !identical(rs, sha)
-            }
-
-            if (need_install) {
-              remotes::install_github(
-                paste0("gregorkastner/threshtvp@", sha),
-                dependencies=FALSE,
-                upgrade="never",
-                quiet=TRUE
-              )
-            }
-
             stopifnot(requireNamespace("threshtvp", quietly=TRUE))
-            d <- utils::packageDescription("threshtvp")
-            cat("threshtvp version:", as.character(utils::packageVersion("threshtvp")), "\n")
-            cat("threshtvp RemoteSha:", as.character(d$RemoteSha), "\n")
+            cat(
+              "threshtvp version:",
+              as.character(utils::packageVersion("threshtvp")),
+              "\n"
+            )
           '
+
+          printf '%s\n' "${ACTUAL_SHA}" > threshtvp_pinned_sha.txt
 
       - name: Run formal country-chain TVP MCMC
         shell: bash
