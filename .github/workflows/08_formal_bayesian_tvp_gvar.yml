@@ -240,7 +240,7 @@ jobs:
             any::dlm
             any::snowfall
 
-      - name: Install pinned threshtvp without GitHub API
+      - name: Install pinned threshtvp from clean Linux source build
         shell: bash
         run: |
           set -euo pipefail
@@ -248,10 +248,7 @@ jobs:
           THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
           rm -rf threshtvp_src
 
-          # Do not use remotes::install_github() here. That route first queries
-          # api.github.com/.../contents/DESCRIPTION?ref=<sha>, which can fail
-          # independently of git access. Clone the repository and checkout the
-          # exact reproducibility commit instead.
+          # Clone and checkout the exact reproducibility commit.
           git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
           git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
 
@@ -269,16 +266,67 @@ jobs:
             exit 1
           }
 
-          R CMD INSTALL --no-multiarch --with-keep.source threshtvp_src
+          # IMPORTANT:
+          # This historical source commit contains precompiled build products
+          # (src/*.o and src/threshtvp.so). They were compiled on another
+          # platform and must NEVER be reused on the Ubuntu Actions runner.
+          echo "=== Pre-existing compiled files in upstream source ==="
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -print -exec file {} \; || true
 
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          echo "=== Source directory after binary cleanup ==="
+          find threshtvp_src/src -maxdepth 1 -type f -print | sort
+
+          if find threshtvp_src/src -maxdepth 1 -type f \
+              \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+              | grep -q .; then
+            echo "::error::Precompiled threshtvp build products remain after cleanup."
+            exit 1
+          fi
+
+          # Force a clean compile from the committed C++ sources on this Linux
+          # runner. --preclean is deliberate even after manual deletion.
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+          # Verify both namespace loading and the platform format of the newly
+          # compiled shared object before launching any expensive MCMC job.
           Rscript --vanilla -e '
             stopifnot(requireNamespace("threshtvp", quietly=TRUE))
-            cat(
-              "threshtvp version:",
-              as.character(utils::packageVersion("threshtvp")),
-              "\n"
+            pkg <- find.package("threshtvp")
+            so <- list.files(
+              file.path(pkg, "libs"),
+              pattern="threshtvp[.]so$",
+              recursive=TRUE,
+              full.names=TRUE
             )
+            if (length(so) != 1L) {
+              stop("Expected exactly one installed threshtvp.so; found ", length(so))
+            }
+            cat("threshtvp version:",
+                as.character(utils::packageVersion("threshtvp")), "\n")
+            cat("installed package:", pkg, "\n")
+            cat("installed shared object:", so, "\n")
+            writeLines(so, "threshtvp_installed_so_path.txt")
           '
+
+          SO_PATH="$(cat threshtvp_installed_so_path.txt)"
+          echo "=== Newly compiled shared object ==="
+          file "${SO_PATH}"
+
+          file "${SO_PATH}" | grep -q 'ELF' || {
+            echo "::error::Newly compiled threshtvp.so is not a Linux ELF shared object."
+            exit 1
+          }
 
           printf '%s\n' "${ACTUAL_SHA}" > threshtvp_pinned_sha.txt
 
