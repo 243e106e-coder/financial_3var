@@ -1,0 +1,378 @@
+name: Financial 3var TVP 08d specification mixing diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      burn_per_chain:
+        description: "Diagnostic burn-in per chain"
+        required: true
+        default: "3000"
+        type: string
+      postburn_per_chain:
+        description: "Diagnostic post-burn iterations per chain"
+        required: true
+        default: "6000"
+        type: string
+      stored_per_chain:
+        description: "Strictly post-burn draws stored per chain"
+        required: true
+        default: "1000"
+        type: string
+      max_parallel:
+        description: "Maximum simultaneous jobs"
+        required: true
+        default: "8"
+        type: string
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Verify diagnostic scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "R/00_config.R"
+            "R/10_build_financial_3var_input.R"
+            "R/15_variable_transformation_audit.R"
+            "R/20_weight_preflight.R"
+            "R/30_stability_grid.R"
+            "R/40_estimation_gate.R"
+            "R/53_event_calendar.R"
+            "R/54_build_tvp_irf_targets.R"
+            "R/60_formal_bayesian_tvp_gvar.R"
+            "R/61d_specification_mixing_diagnostics.R"
+          )
+          for f in "${required[@]}"; do
+            test -f "$f" || { echo "::error::Missing required file: $f"; exit 1; }
+          done
+
+      - name: Fetch validated source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+          git -C source_repo sparse-checkout set 8.12
+
+          required=(
+            "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx"
+            "source_repo/8.12/gpr_quarterly_processed.csv"
+            "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv"
+            "source_repo/8.12/Trade_Weights_14_Economies_2000_2014.csv"
+          )
+          for f in "${required[@]}"; do
+            test -f "$f" || { echo "::error::Missing source input: $f"; exit 1; }
+          done
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install prepare-stage dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+            any::urca
+
+      - name: Build and reconfirm accepted input/gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/10_build_financial_3var_input.R
+          Rscript --vanilla R/15_variable_transformation_audit.R
+          Rscript --vanilla R/20_weight_preflight.R
+          Rscript --vanilla R/30_stability_grid.R
+          Rscript --vanilla R/40_estimation_gate.R
+          Rscript --vanilla R/53_event_calendar.R
+          Rscript --vanilla R/54_build_tvp_irf_targets.R
+
+          Rscript --vanilla -e '
+            tg <- read.csv("results/variable_transform/11_transformation_integrity_gate.csv")
+            eg <- read.csv("results/gate/01_estimation_gate.csv")
+            ev <- read.csv("results/events/00_event_calendar.csv")
+            if (!all(tg$Pass)) stop("Transformation integrity gate failed.")
+            if (nrow(eg)!=1L || eg$Status[1]!="READY") stop("Static estimation gate is not READY.")
+            if (!all(ev$EventWindowReady)) stop("Event-window gate failed.")
+            cat("08D PRE-GATES: READY\n")
+          '
+
+      - name: Upload diagnostic inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08d-input-${{ github.run_id }}
+          path: |
+            data/derived/
+            results/variable_transform/
+            results/preflight/
+            results/stability/
+            results/gate/
+            results/events/
+          if-no-files-found: error
+          retention-days: 30
+
+  estimate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        country: [US, CN]
+        chain: [1, 2, 3, 4]
+        spec: [BASELINE, NOSV, SHRINK, KAPPA]
+
+    env:
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_SPEC: ${{ matrix.spec }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: "20260920"
+      FIN3_TVS_ON: "true"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download prepared diagnostic inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08d-input-${{ github.run_id }}
+          path: .
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp from clean Linux source build
+        shell: bash
+        run: |
+          set -euo pipefail
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          rm -rf threshtvp_src
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+          ACTUAL_SHA="$(git -C threshtvp_src rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${THRESHTVP_SHA}" || {
+            echo "::error::threshtvp checkout SHA mismatch."; exit 1;
+          }
+
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          R CMD INSTALL --preclean --clean --no-multiarch --with-keep.source threshtvp_src
+
+          Rscript --vanilla -e '
+            stopifnot(requireNamespace("threshtvp", quietly=TRUE))
+            pkg <- find.package("threshtvp")
+            so <- list.files(file.path(pkg,"libs"), pattern="threshtvp[.]so$", recursive=TRUE, full.names=TRUE)
+            if (length(so)!=1L) stop("Expected one threshtvp.so; found ", length(so))
+            writeLines(so, "threshtvp_installed_so_path.txt")
+          '
+          SO_PATH="$(cat threshtvp_installed_so_path.txt)"
+          file "${SO_PATH}" | grep -q 'ELF' || {
+            echo "::error::Newly compiled threshtvp.so is not Linux ELF."; exit 1;
+          }
+
+      - name: Set diagnostic specification and run MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${FIN3_SPEC}" in
+            BASELINE)
+              export FIN3_SV_ON="true"
+              export FIN3_TTVP_B1="2"
+              export FIN3_TTVP_B2="1"
+              export FIN3_TTVP_KAPPA0="1e-7"
+              ;;
+            NOSV)
+              export FIN3_SV_ON="false"
+              export FIN3_TTVP_B1="2"
+              export FIN3_TTVP_B2="1"
+              export FIN3_TTVP_KAPPA0="1e-7"
+              ;;
+            SHRINK)
+              # Diagnostic stronger shrinkage on high-regime state innovation variance.
+              export FIN3_SV_ON="true"
+              export FIN3_TTVP_B1="5"
+              export FIN3_TTVP_B2="0.1"
+              export FIN3_TTVP_KAPPA0="1e-7"
+              ;;
+            KAPPA)
+              # Relax near-zero lower-regime state innovation scale.
+              export FIN3_SV_ON="true"
+              export FIN3_TTVP_B1="2"
+              export FIN3_TTVP_B2="1"
+              export FIN3_TTVP_KAPPA0="1e-4"
+              ;;
+            *)
+              echo "::error::Unknown FIN3_SPEC=${FIN3_SPEC}"; exit 1;;
+          esac
+
+          echo "Spec=${FIN3_SPEC} Country=${FIN3_COUNTRY} Chain=${FIN3_CHAIN_ID}"
+          echo "SV=${FIN3_SV_ON} B1=${FIN3_TTVP_B1} B2=${FIN3_TTVP_B2} Kappa0=${FIN3_TTVP_KAPPA0}"
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+          SRC="results/formal_tvp_parts/${FIN3_COUNTRY}/chain_${FIN3_CHAIN_ID}"
+          DEST="results/specdiag_parts/${FIN3_SPEC}/${FIN3_COUNTRY}/chain_${FIN3_CHAIN_ID}"
+          test -d "${SRC}" || { echo "::error::Missing R60 output ${SRC}"; exit 1; }
+          mkdir -p "${DEST}"
+          cp -a "${SRC}/." "${DEST}/"
+
+          cat > "${DEST}/08d_spec_manifest.txt" <<MANIFEST
+          spec=${FIN3_SPEC}
+          country=${FIN3_COUNTRY}
+          chain=${FIN3_CHAIN_ID}
+          sv_on=${FIN3_SV_ON}
+          tvs_on=${FIN3_TVS_ON}
+          B1=${FIN3_TTVP_B1}
+          B2=${FIN3_TTVP_B2}
+          kappa0=${FIN3_TTVP_KAPPA0}
+          burn=${FIN3_BURN}
+          keep=${FIN3_KEEP}
+          stored=${FIN3_STORED_PER_CHAIN}
+          MANIFEST
+
+      - name: Upload diagnostic posterior part
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08d-${{ matrix.spec }}-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/specdiag_parts/${{ matrix.spec }}/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  diagnose:
+    needs: [prepare, estimate]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_DIAG_COUNTRIES: "US,CN"
+      FIN3_DIAG_SPECS: "BASELINE,NOSV,SHRINK,KAPPA"
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download all 08d posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08d-*-*-chain*-${{ github.run_id }}
+          path: posterior_parts
+
+      - name: Rebuild unique specification paths from artifact folders
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Downloaded artifact tree:"
+          find posterior_parts -maxdepth 5 -type f | sort | head -200
+
+          # actions/download-artifact keeps one folder per artifact. R61d infers
+          # the spec from a normalized specdiag_parts/<SPEC>/... path, so create
+          # a clean merged tree using each manifest and posterior RDS.
+          rm -rf posterior_parts_merged
+          mkdir -p posterior_parts_merged/specdiag_parts
+
+          while IFS= read -r manifest; do
+            spec="$(sed -n 's/^spec=//p' "$manifest" | head -1)"
+            country="$(sed -n 's/^country=//p' "$manifest" | head -1)"
+            chain="$(sed -n 's/^chain=//p' "$manifest" | head -1)"
+            test -n "$spec" && test -n "$country" && test -n "$chain" || {
+              echo "::error::Malformed manifest: $manifest"; exit 1;
+            }
+            srcdir="$(dirname "$manifest")"
+            dest="posterior_parts_merged/specdiag_parts/${spec}/${country}/chain_${chain}"
+            mkdir -p "$dest"
+            cp -a "$srcdir/." "$dest/"
+          done < <(find posterior_parts -type f -name '08d_spec_manifest.txt' | sort)
+
+          count="$(find posterior_parts_merged -type f -name 'formal_tvp_*_chain*.rds' | wc -l | tr -d ' ')"
+          echo "Merged posterior RDS count=${count}"
+          test "$count" = "32" || {
+            echo "::error::Expected 32 posterior RDS files, found ${count}."; exit 1;
+          }
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install diagnostic dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Run 08d mixing diagnostics
+        shell: bash
+        env:
+          FIN3_PARTS_ROOT: posterior_parts_merged
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61d_specification_mixing_diagnostics.R
+
+      - name: Show 08d decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== 08D DIAGNOSTIC GATE ==="
+          test -f results/specification_mixing_diagnostic/00_specification_diagnostic_gate.csv && \
+            cat results/specification_mixing_diagnostic/00_specification_diagnostic_gate.csv || true
+          echo
+          echo "=== SPEC RANKING ==="
+          test -f results/specification_mixing_diagnostic/04_overall_spec_ranking.csv && \
+            cat results/specification_mixing_diagnostic/04_overall_spec_ranking.csv || true
+          echo
+          echo "=== FAMILY SUMMARY ==="
+          test -f results/specification_mixing_diagnostic/03_family_spec_summary.csv && \
+            cat results/specification_mixing_diagnostic/03_family_spec_summary.csv || true
+
+      - name: Upload 08d diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08d-diagnostics-${{ github.run_id }}
+          path: results/specification_mixing_diagnostic/
+          if-no-files-found: warn
+          retention-days: 30
