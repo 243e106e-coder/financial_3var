@@ -1,0 +1,587 @@
+name: Financial 3var 08g AU convergence rescue and formal IRF
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "08f source run ID providing the accepted 13-country posterior and prepared input"
+        required: true
+        default: "33488003323"
+        type: string
+      source_ref:
+        description: "Exact 08f source commit SHA; code is checked out at this ref"
+        required: true
+        default: "b349187330d97ee208628d4b5d84a965cba086e4"
+        type: string
+      au_burn_per_chain:
+        description: "AU-only extended burn-in iterations per chain"
+        required: true
+        default: "7500"
+        type: string
+      au_postburn_per_chain:
+        description: "AU-only extended internal post-burn iterations per chain"
+        required: true
+        default: "20000"
+        type: string
+      stored_per_chain:
+        description: "Stored draws per chain; MUST stay 2000 to match the 13-country 08f posterior"
+        required: true
+        default: "2000"
+        type: string
+      seed_base:
+        description: "Keep the 08f seed base so AU chains extend the same seeded chains"
+        required: true
+        default: "20260910"
+        type: string
+      gpr_shock_pct:
+        description: "Positive GPR shock in percent"
+        required: true
+        default: "10"
+        type: string
+      irf_horizon:
+        description: "IRF horizon in quarters"
+        required: true
+        default: "12"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify_source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+    steps:
+      - name: Checkout exact 08f source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Verify source run, commit, workflow and artifact grid
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "${STORED_PER_CHAIN}" = "2000" || {
+            echo "::error::08g is designed to combine with 08f stored=2000 posterior. Do not change stored_per_chain."
+            exit 1
+          }
+
+          CHECKOUT_SHA="$(git rev-parse HEAD)"
+          test "${CHECKOUT_SHA}" = "${SOURCE_REF}" || {
+            echo "::error::Checkout SHA ${CHECKOUT_SHA} != requested source_ref ${SOURCE_REF}."
+            exit 1
+          }
+
+          RUN_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
+          RUN_SHA="$(jq -r '.head_sha' <<<"${RUN_JSON}")"
+          RUN_STATUS="$(jq -r '.status' <<<"${RUN_JSON}")"
+          RUN_PATH="$(jq -r '.path' <<<"${RUN_JSON}")"
+
+          echo "Source run id: ${SOURCE_RUN_ID}"
+          echo "Source run SHA: ${RUN_SHA}"
+          echo "Source run status: ${RUN_STATUS}"
+          echo "Source workflow: ${RUN_PATH}"
+
+          test "${RUN_STATUS}" = "completed" || {
+            echo "::error::Source run is not completed."
+            exit 1
+          }
+          test "${RUN_SHA}" = "${SOURCE_REF}" || {
+            echo "::error::source_ref does not match source run head SHA."
+            exit 1
+          }
+          test "${RUN_PATH}" = ".github/workflows/08f_formal_bayesian_tvp_gvar_kappa1e4.yml" || {
+            echo "::error::Source run is not the 08f kappa1e-4 formal workflow."
+            exit 1
+          }
+
+          ART_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100")"
+          TOTAL="$(jq -r '.total_count' <<<"${ART_JSON}")"
+          PARTS="$(jq -r --arg rid "${SOURCE_RUN_ID}" '[.artifacts[] | select(.expired == false and (.name | startswith("financial-3var-formal-kappa1e4-part-")) and (.name | endswith("-" + $rid)))] | length' <<<"${ART_JSON}")"
+          INPUTS="$(jq -r --arg name "financial-3var-formal-kappa1e4-input-${SOURCE_RUN_ID}" '[.artifacts[] | select(.expired == false and .name == $name)] | length' <<<"${ART_JSON}")"
+
+          echo "Source artifacts total: ${TOTAL}"
+          echo "Unexpired posterior parts matching 08f: ${PARTS}"
+          echo "Unexpired prepared-input artifacts: ${INPUTS}"
+
+          test "${PARTS}" = "56" || {
+            echo "::error::Expected exactly 56 unexpired 08f country-chain posterior artifacts; found ${PARTS}."
+            exit 1
+          }
+          test "${INPUTS}" = "1" || {
+            echo "::error::Expected exactly one unexpired 08f prepared-input artifact; found ${INPUTS}."
+            exit 1
+          }
+
+          for f in R/60_formal_bayesian_tvp_gvar.R R/61_formal_mcmc_diagnostics.R R/62_structural_gpr_tvp_irf.R; do
+            test -f "$f" || {
+              echo "::error::Missing source-ref script: $f"
+              exit 1
+            }
+          done
+
+          echo "08G SOURCE INTEGRITY: PASS"
+
+  estimate_au:
+    needs: verify_source
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_COUNTRY: "AU"
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.au_burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.au_postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+
+    steps:
+      - name: Checkout exact 08f source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Download exact 08f prepared input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-formal-kappa1e4-input-${{ inputs.source_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Verify prepared input and AU rescue contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/derived/panel_domestic_fin3.csv || {
+            echo "::error::Prepared formal panel missing after source artifact download."
+            exit 1
+          }
+          test -f results/events/00_event_calendar.csv || {
+            echo "::error::Event calendar missing after source artifact download."
+            exit 1
+          }
+          test "${FIN3_STORED_PER_CHAIN}" = "2000" || {
+            echo "::error::stored_per_chain must remain 2000 for mixed-posterior compatibility."
+            exit 1
+          }
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4" || {
+            echo "::error::08g must retain formal kappa0=1e-4."
+            exit 1
+          }
+          echo "AU chain=${FIN3_CHAIN_ID}; burn=${FIN3_BURN}; postburn=${FIN3_KEEP}; stored=${FIN3_STORED_PER_CHAIN}; kappa0=${FIN3_TTVP_KAPPA0}"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp from clean Linux source build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          rm -rf threshtvp_src
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          ACTUAL_SHA="$(git -C threshtvp_src rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${THRESHTVP_SHA}" || {
+            echo "::error::threshtvp checkout SHA mismatch."
+            exit 1
+          }
+
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -print -delete || true
+
+          if find threshtvp_src/src -maxdepth 1 -type f \
+              \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+              | grep -q .; then
+            echo "::error::Precompiled threshtvp build products remain after cleanup."
+            exit 1
+          fi
+
+          R CMD INSTALL --preclean --clean --no-multiarch --with-keep.source threshtvp_src
+
+          Rscript --vanilla -e '
+            stopifnot(requireNamespace("threshtvp", quietly=TRUE))
+            pkg <- find.package("threshtvp")
+            so <- list.files(file.path(pkg, "libs"), pattern="threshtvp[.]so$", recursive=TRUE, full.names=TRUE)
+            if (length(so) != 1L) stop("Expected exactly one installed threshtvp.so; found ", length(so))
+            writeLines(so, "threshtvp_installed_so_path.txt")
+          '
+
+          SO_PATH="$(cat threshtvp_installed_so_path.txt)"
+          file "${SO_PATH}"
+          file "${SO_PATH}" | grep -q 'ELF' || {
+            echo "::error::Newly compiled threshtvp.so is not a Linux ELF shared object."
+            exit 1
+          }
+
+      - name: Run AU extended formal TVP MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Validate AU posterior metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            f <- list.files("results/formal_tvp_parts/AU", pattern="^formal_tvp_AU_chain[0-9]+[.]rds$", recursive=TRUE, full.names=TRUE)
+            if (length(f) != 1L) stop("Expected exactly one AU chain RDS; found ", length(f))
+            z <- readRDS(f)
+            stopifnot(z$meta$country == "AU")
+            stopifnot(z$meta$chain == as.integer(Sys.getenv("FIN3_CHAIN_ID")))
+            stopifnot(z$meta$stored_draws == 2000L)
+            stopifnot(z$meta$burn == as.integer(Sys.getenv("FIN3_BURN")))
+            stopifnot(z$meta$keep_internal == as.integer(Sys.getenv("FIN3_KEEP")))
+            cat("AU RESCUE POSTERIOR: PASS\n")
+          '
+
+      - name: Upload AU extended posterior part
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08g-AU-part-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/AU/chain_${{ matrix.chain }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  diagnose:
+    needs: [verify_source, estimate_au]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      AU_BURN: ${{ inputs.au_burn_per_chain }}
+      AU_KEEP: ${{ inputs.au_postburn_per_chain }}
+
+    steps:
+      - name: Checkout exact 08f source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Download all 56 source 08f posterior artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-formal-kappa1e4-part-*-${{ inputs.source_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Remove the four failed-source AU posterior artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          old_au=(posterior_parts/financial-3var-formal-kappa1e4-part-AU-chain*-${SOURCE_RUN_ID})
+          echo "Old AU artifact directories found: ${#old_au[@]}"
+          test "${#old_au[@]}" -eq 4 || {
+            echo "::error::Expected four source AU artifact directories before replacement."
+            exit 1
+          }
+          rm -rf "${old_au[@]}"
+
+      - name: Download four new AU extended posterior artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08g-AU-part-chain*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Verify exact mixed 14-country x 4-chain posterior grid
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            source("R/00_config.R")
+            fs <- list.files("posterior_parts", pattern="^formal_tvp_[A-Z]{2}_chain[0-9]+[.]rds$", recursive=TRUE, full.names=TRUE)
+            if (length(fs) != 56L) stop("Expected 56 posterior RDS files; found ", length(fs))
+            ix <- do.call(rbind, lapply(fs, function(f) {
+              z <- readRDS(f)
+              data.frame(Country=z$meta$country, Chain=z$meta$chain, Burn=z$meta$burn,
+                         Keep=z$meta$keep_internal, Stored=z$meta$stored_draws,
+                         File=f, stringsAsFactors=FALSE)
+            }))
+            key <- paste(ix$Country, ix$Chain, sep="||")
+            if (anyDuplicated(key)) stop("Duplicate country-chain RDS detected.")
+            exp <- paste(rep(COUNTRIES, each=4), rep(1:4, times=length(COUNTRIES)), sep="||")
+            miss <- setdiff(exp, key)
+            if (length(miss)) stop("Missing posterior parts: ", paste(miss, collapse=", "))
+            if (any(ix$Stored != 2000L)) stop("Stored draw mismatch in combined posterior.")
+            au <- ix[ix$Country == "AU",]
+            oth <- ix[ix$Country != "AU",]
+            if (!all(au$Burn == as.integer(Sys.getenv("AU_BURN")))) stop("AU burn metadata mismatch.")
+            if (!all(au$Keep == as.integer(Sys.getenv("AU_KEEP")))) stop("AU keep metadata mismatch.")
+            if (!all(oth$Burn == 5000L)) stop("Non-AU source burn should be 5000.")
+            if (!all(oth$Keep == 10000L)) stop("Non-AU source keep should be 10000.")
+            cat("MIXED POSTERIOR GRID: PASS (52 source + 4 extended AU)\n")
+          '
+
+      - name: Run unchanged formal R61 convergence diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61_formal_mcmc_diagnostics.R
+
+      - name: Add 08g mixed-chain provenance without changing convergence thresholds
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            p <- read.csv("results/formal_tvp/00_parts_index.csv", stringsAsFactors=FALSE, check.names=FALSE)
+            p$PosteriorOrigin <- ifelse(p$Country == "AU", "08g_AU_extended", "08f_source_reused")
+            p$SourceRunID <- ifelse(p$Country == "AU", Sys.getenv("GITHUB_RUN_ID"), Sys.getenv("SOURCE_RUN_ID"))
+            p$SourceCommitSHA <- Sys.getenv("SOURCE_REF")
+            write.csv(p, "results/formal_tvp/05_08g_chain_length_provenance.csv", row.names=FALSE)
+
+            g <- read.csv("results/formal_tvp/00_formal_mcmc_gate.csv", stringsAsFactors=FALSE, check.names=FALSE)
+            g$RescueDesign <- "AU_ONLY_EXTENDED_CHAINS__13_COUNTRIES_REUSED_FROM_08F"
+            g$Source08fRunID <- Sys.getenv("SOURCE_RUN_ID")
+            g$Source08fCommitSHA <- Sys.getenv("SOURCE_REF")
+            g$RescuedCountry <- "AU"
+            g$NonAUBurnPerChain <- 5000L
+            g$NonAUInternalPostBurnPerChain <- 10000L
+            g$AUBurnPerChain <- as.integer(Sys.getenv("AU_BURN"))
+            g$AUInternalPostBurnPerChain <- as.integer(Sys.getenv("AU_KEEP"))
+            g$StoredDrawsPerChainAllCountries <- 2000L
+            g$ChainLengthNote <- "Legacy BurnPerChain/InternalPostBurn fields are generated by R61 from the first country (AU); use the explicit AU/non-AU fields added by 08g."
+            write.csv(g, "results/formal_tvp/00_formal_mcmc_gate.csv", row.names=FALSE)
+
+            txt <- c(
+              "08g AU-only convergence rescue",
+              paste0("Source 08f run: ", Sys.getenv("SOURCE_RUN_ID")),
+              paste0("Source commit SHA: ", Sys.getenv("SOURCE_REF")),
+              "Reused posterior: BR, CA, CH, CN, EA, UK, JP, KR, NO, SG, TR, US, ZA; 4 chains each; burn=5000; internal post-burn=10000; stored=2000.",
+              paste0("Re-estimated posterior: AU; 4 chains; burn=", Sys.getenv("AU_BURN"), "; internal post-burn=", Sys.getenv("AU_KEEP"), "; stored=2000."),
+              "Formal convergence thresholds are unchanged: hard Rhat<=1.05, target-share Rhat<=1.01 >=95%, hard bulk/tail ESS>=100, target bulk/tail ESS>=400 share >=90%.",
+              "R62 is allowed to run only when Status=READY_FOR_FORMAL_IRF."
+            )
+            writeLines(txt, "results/formal_tvp/README_08g_provenance.txt")
+          '
+
+      - name: Show formal convergence gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat results/formal_tvp/00_formal_mcmc_gate.csv || true
+          echo
+          cat results/formal_tvp/README_08g_provenance.txt || true
+
+      - name: Upload 08g convergence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08g-convergence-${{ github.run_id }}
+          path: results/formal_tvp/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce unchanged formal MCMC convergence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            g <- read.csv("results/formal_tvp/00_formal_mcmc_gate.csv", stringsAsFactors=FALSE)
+            if (nrow(g) != 1L || g$Status[1] != "READY_FOR_FORMAL_IRF") {
+              print(g)
+              stop("08g mixed posterior still fails the unchanged formal MCMC convergence gate.")
+            }
+            cat("08G FORMAL MCMC: READY_FOR_FORMAL_IRF\n")
+          '
+
+  irf:
+    needs: [verify_source, estimate_au, diagnose]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_CONVERGENCE_DIR: results/formal_tvp
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_IRF_HORIZON: ${{ inputs.irf_horizon }}
+      FIN3_GPR_SHOCK_PCT: ${{ inputs.gpr_shock_pct }}
+      FIN3_IRF_MIN_STABLE_SHARE: "0.90"
+      FIN3_IRF_MIN_G0_RCOND: "1e-10"
+      FIN3_IRF_CORES: "2"
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+
+    steps:
+      - name: Checkout exact 08f source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Download exact 08f prepared input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-formal-kappa1e4-input-${{ inputs.source_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Download all 56 source 08f posterior artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-formal-kappa1e4-part-*-${{ inputs.source_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Remove source AU posterior before replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          old_au=(posterior_parts/financial-3var-formal-kappa1e4-part-AU-chain*-${SOURCE_RUN_ID})
+          test "${#old_au[@]}" -eq 4 || {
+            echo "::error::Expected four source AU artifact directories in IRF assembly."
+            exit 1
+          }
+          rm -rf "${old_au[@]}"
+
+      - name: Download four new AU extended posterior artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08g-AU-part-chain*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Download passed 08g convergence artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08g-convergence-${{ github.run_id }}
+          path: convergence_download
+
+      - name: Normalize convergence artifact location and verify formal gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          GATE="$(find convergence_download -type f -name '00_formal_mcmc_gate.csv' -print -quit)"
+          test -n "${GATE}" || {
+            echo "::error::08g convergence gate file not found in downloaded artifact."
+            exit 1
+          }
+          SRC_DIR="$(dirname "${GATE}")"
+          rm -rf results/formal_tvp
+          mkdir -p results/formal_tvp
+          cp -a "${SRC_DIR}/." results/formal_tvp/
+
+          Rscript --vanilla -e '
+            g <- read.csv("results/formal_tvp/00_formal_mcmc_gate.csv", stringsAsFactors=FALSE)
+            if (nrow(g) != 1L || g$Status[1] != "READY_FOR_FORMAL_IRF") stop("Downloaded 08g gate is not READY_FOR_FORMAL_IRF.")
+            cat("IRF INPUT CONVERGENCE GATE: READY\n")
+          '
+
+      - name: Verify exact 56-RDS posterior grid before R62
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT="$(find posterior_parts -type f -name 'formal_tvp_*_chain*.rds' | wc -l | tr -d ' ')"
+          AUCOUNT="$(find posterior_parts -type f -name 'formal_tvp_AU_chain*.rds' | wc -l | tr -d ' ')"
+          echo "Total posterior RDS: ${COUNT}"
+          echo "AU posterior RDS: ${AUCOUNT}"
+          test "${COUNT}" = "56" || {
+            echo "::error::Expected 56 posterior RDS files before R62."
+            exit 1
+          }
+          test "${AUCOUNT}" = "4" || {
+            echo "::error::Expected four AU posterior RDS files before R62."
+            exit 1
+          }
+          test -f results/events/00_event_calendar.csv || {
+            echo "::error::Prepared event calendar missing before R62."
+            exit 1
+          }
+
+      - name: Run formal structural GPR TVP-IRFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/62_structural_gpr_tvp_irf.R
+
+      - name: Show formal IRF gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find results/formal_irf -maxdepth 2 -type f -print | sort || true
+          test -f results/formal_irf/00_formal_irf_gate.csv && cat results/formal_irf/00_formal_irf_gate.csv || true
+
+      - name: Upload 08g formal IRF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08g-formal-irf-${{ github.run_id }}
+          path: results/formal_irf/
+          if-no-files-found: error
+          retention-days: 30
