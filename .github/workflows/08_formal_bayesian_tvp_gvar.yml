@@ -1,0 +1,467 @@
+name: Financial 3var formal Bayesian TVP-GVAR and GPR IRF
+
+on:
+  workflow_dispatch:
+    inputs:
+      burn_per_chain:
+        description: "Burn-in iterations per country-chain"
+        required: true
+        default: "5000"
+        type: string
+      postburn_per_chain:
+        description: "Post-burn MCMC iterations per country-chain (internal; before storage thinning)"
+        required: true
+        default: "7500"
+        type: string
+      stored_per_chain:
+        description: "Strictly post-burn draws stored per country-chain for diagnostics and IRFs"
+        required: true
+        default: "1500"
+        type: string
+      seed_base:
+        description: "Base seed; country and chain offsets are added automatically"
+        required: true
+        default: "20260910"
+        type: string
+      gpr_shock_pct:
+        description: "Positive GPR shock in percent; LN_GPR_QMEAN uses log(1+pct/100)"
+        required: true
+        default: "10"
+        type: string
+      irf_horizon:
+        description: "IRF horizon in quarters"
+        required: true
+        default: "12"
+        type: string
+      max_parallel:
+        description: "Maximum simultaneous country-chain jobs"
+        required: true
+        default: "14"
+        type: string
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Verify formal scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            "R/00_config.R"
+            "R/10_build_financial_3var_input.R"
+            "R/15_variable_transformation_audit.R"
+            "R/20_weight_preflight.R"
+            "R/30_stability_grid.R"
+            "R/40_estimation_gate.R"
+            "R/53_event_calendar.R"
+            "R/54_build_tvp_irf_targets.R"
+            "R/60_formal_bayesian_tvp_gvar.R"
+            "R/61_formal_mcmc_diagnostics.R"
+            "R/62_structural_gpr_tvp_irf.R"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing required file: $f"
+              exit 1
+            }
+          done
+
+      - name: Fetch validated source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+          git -C source_repo sparse-checkout set 8.12
+
+          required=(
+            "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx"
+            "source_repo/8.12/gpr_quarterly_processed.csv"
+            "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv"
+            "source_repo/8.12/Trade_Weights_14_Economies_2000_2014.csv"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing source input: $f"
+              exit 1
+            }
+          done
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install prepare-stage dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+            any::urca
+
+      - name: Build clean 3-variable panel
+        run: Rscript --vanilla R/10_build_financial_3var_input.R
+
+      - name: Audit variable transformations
+        run: Rscript --vanilla R/15_variable_transformation_audit.R
+
+      - name: Validate financial weights
+        run: Rscript --vanilla R/20_weight_preflight.R
+
+      - name: Reconfirm static p1 q1 stability
+        run: Rscript --vanilla R/30_stability_grid.R
+
+      - name: Reconfirm static estimation gate
+        run: Rscript --vanilla R/40_estimation_gate.R
+
+      - name: Build event calendar
+        run: Rscript --vanilla R/53_event_calendar.R
+
+      - name: Build TVP-IRF target grid
+        run: Rscript --vanilla R/54_build_tvp_irf_targets.R
+
+      - name: Enforce pre-formal gates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            tg <- read.csv(
+              "results/variable_transform/11_transformation_integrity_gate.csv",
+              stringsAsFactors=FALSE
+            )
+            eg <- read.csv(
+              "results/gate/01_estimation_gate.csv",
+              stringsAsFactors=FALSE
+            )
+            ev <- read.csv(
+              "results/events/00_event_calendar.csv",
+              stringsAsFactors=FALSE
+            )
+
+            if (!all(tg$Pass)) stop("Transformation integrity gate failed.")
+            if (nrow(eg) != 1L || eg$Status[1] != "READY") {
+              stop("Static estimation gate is not READY.")
+            }
+            if (!all(ev$EventWindowReady)) stop("Event-window gate failed.")
+
+            cat("PRE-FORMAL GATES: READY\n")
+          '
+
+      - name: Upload formal input artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-formal-input-${{ github.run_id }}
+          path: |
+            data/derived/
+            results/variable_transform/
+            results/preflight/
+            results/stability/
+            results/gate/
+            results/events/
+          if-no-files-found: error
+          retention-days: 30
+
+  estimate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        country:
+          - AU
+          - BR
+          - CA
+          - CH
+          - CN
+          - EA
+          - UK
+          - JP
+          - KR
+          - NO
+          - SG
+          - TR
+          - US
+          - ZA
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-7"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download prepared formal inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-formal-input-${{ github.run_id }}
+          path: .
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+            any::remotes
+
+      - name: Install pinned threshtvp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            sha <- "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+            need_install <- TRUE
+
+            if (requireNamespace("threshtvp", quietly=TRUE)) {
+              d <- utils::packageDescription("threshtvp")
+              rs <- if (!is.null(d$RemoteSha)) as.character(d$RemoteSha) else ""
+              need_install <- !identical(rs, sha)
+            }
+
+            if (need_install) {
+              remotes::install_github(
+                paste0("gregorkastner/threshtvp@", sha),
+                dependencies=FALSE,
+                upgrade="never",
+                quiet=TRUE
+              )
+            }
+
+            stopifnot(requireNamespace("threshtvp", quietly=TRUE))
+            d <- utils::packageDescription("threshtvp")
+            cat("threshtvp version:", as.character(utils::packageVersion("threshtvp")), "\n")
+            cat("threshtvp RemoteSha:", as.character(d$RemoteSha), "\n")
+          '
+
+      - name: Run formal country-chain TVP MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Upload country-chain posterior part
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-formal-part-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: |
+            results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  diagnose:
+    needs: [prepare, estimate]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download all country-chain posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-formal-part-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: true
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Run formal MCMC convergence diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61_formal_mcmc_diagnostics.R
+
+      - name: Show formal MCMC gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f results/formal_tvp/00_formal_mcmc_gate.csv && \
+            cat results/formal_tvp/00_formal_mcmc_gate.csv || true
+          echo
+          test -f results/formal_tvp/README_formal_mcmc.txt && \
+            cat results/formal_tvp/README_formal_mcmc.txt || true
+
+      - name: Upload formal convergence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-formal-convergence-${{ github.run_id }}
+          path: |
+            results/formal_tvp/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce formal MCMC convergence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            g <- read.csv(
+              "results/formal_tvp/00_formal_mcmc_gate.csv",
+              stringsAsFactors=FALSE
+            )
+            if (nrow(g) != 1L || g$Status[1] != "READY_FOR_FORMAL_IRF") {
+              print(g)
+              stop("Formal MCMC convergence gate failed.")
+            }
+            cat("FORMAL MCMC: READY_FOR_FORMAL_IRF\n")
+          '
+
+  irf:
+    needs: [prepare, diagnose]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_CONVERGENCE_DIR: results/formal_tvp
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_IRF_HORIZON: ${{ inputs.irf_horizon }}
+      FIN3_GPR_SHOCK_PCT: ${{ inputs.gpr_shock_pct }}
+      FIN3_IRF_MIN_STABLE_SHARE: "0.90"
+      FIN3_IRF_MIN_G0_RCOND: "1e-10"
+      FIN3_IRF_CORES: "2"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download prepared formal inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-formal-input-${{ github.run_id }}
+          path: .
+
+      - name: Download all country-chain posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-formal-part-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: true
+
+      - name: Download formal convergence artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-formal-convergence-${{ github.run_id }}
+          path: .
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Generate formal time-specific GPR IRFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/62_structural_gpr_tvp_irf.R
+
+      - name: Show formal IRF gate and worst anchors
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== FORMAL IRF GATE ==="
+          test -f results/formal_irf/00_formal_irf_gate.csv && \
+            cat results/formal_irf/00_formal_irf_gate.csv || true
+
+          echo
+          echo "=== ANCHOR STABILITY ==="
+          test -f results/formal_irf/01_irf_stability_by_anchor.csv && \
+            cat results/formal_irf/01_irf_stability_by_anchor.csv || true
+
+          echo
+          echo "=== README ==="
+          test -f results/formal_irf/README_formal_irf.txt && \
+            cat results/formal_irf/README_formal_irf.txt || true
+
+      - name: Upload formal IRF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-formal-irf-${{ github.run_id }}
+          path: |
+            results/formal_irf/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce formal IRF gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            g <- read.csv(
+              "results/formal_irf/00_formal_irf_gate.csv",
+              stringsAsFactors=FALSE
+            )
+            if (nrow(g) != 1L || g$Status[1] != "READY_FOR_IRF_AUDIT") {
+              print(g)
+              stop("Formal GPR IRF gate failed.")
+            }
+            cat("FORMAL IRF: READY_FOR_IRF_AUDIT\n")
+          '
