@@ -1,0 +1,268 @@
+name: Financial 3var formal TVP two-country single-chain pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      burn:
+        description: "Pilot burn-in"
+        required: true
+        default: "200"
+        type: string
+      postburn:
+        description: "Pilot post-burn iterations"
+        required: true
+        default: "500"
+        type: string
+      stored:
+        description: "Pilot stored strictly-post-burn draws"
+        required: true
+        default: "200"
+        type: string
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        country: [JP, US]
+
+    env:
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: "1"
+      FIN3_BURN: ${{ inputs.burn }}
+      FIN3_KEEP: ${{ inputs.postburn }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored }}
+      FIN3_SEED_BASE: "20260910"
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-7"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Verify pilot files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            "R/00_config.R"
+            "R/10_build_financial_3var_input.R"
+            "R/53_event_calendar.R"
+            "R/54_build_tvp_irf_targets.R"
+            "R/60_formal_bayesian_tvp_gvar.R"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing required file: $f"
+              exit 1
+            }
+          done
+
+      - name: Fetch validated source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+          git -C source_repo sparse-checkout set 8.12
+
+          required=(
+            "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx"
+            "source_repo/8.12/gpr_quarterly_processed.csv"
+            "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv"
+            "source_repo/8.12/Trade_Weights_14_Economies_2000_2014.csv"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing source input: $f"
+              exit 1
+            }
+          done
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install panel dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+
+      - name: Build clean 3-variable panel
+        run: Rscript --vanilla R/10_build_financial_3var_input.R
+
+      - name: Build event calendar
+        run: Rscript --vanilla R/53_event_calendar.R
+
+      - name: Build TVP-IRF target grid
+        run: Rscript --vanilla R/54_build_tvp_irf_targets.R
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp from clean Linux source build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          rm -rf threshtvp_src
+
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          ACTUAL_SHA="$(git -C threshtvp_src rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${THRESHTVP_SHA}" || {
+            echo "::error::threshtvp checkout SHA mismatch."
+            exit 1
+          }
+
+          echo "=== Removing upstream precompiled build products ==="
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -print -exec file {} \; || true
+
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+          Rscript --vanilla -e '
+            stopifnot(requireNamespace("threshtvp", quietly=TRUE))
+            pkg <- find.package("threshtvp")
+            so <- list.files(
+              file.path(pkg, "libs"),
+              pattern="threshtvp[.]so$",
+              full.names=TRUE,
+              recursive=TRUE
+            )
+            stopifnot(length(so) == 1L)
+            cat("threshtvp version:",
+                as.character(utils::packageVersion("threshtvp")), "\n")
+            cat("shared object:", so, "\n")
+            writeLines(so, "threshtvp_so.txt")
+          '
+
+          file "$(cat threshtvp_so.txt)"
+          file "$(cat threshtvp_so.txt)" | grep -q 'ELF' || {
+            echo "::error::Installed threshtvp.so is not Linux ELF."
+            exit 1
+          }
+
+      - name: Run country single-chain formal TVP pilot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Country=${FIN3_COUNTRY}"
+          echo "Burn=${FIN3_BURN}"
+          echo "Postburn=${FIN3_KEEP}"
+          echo "Stored=${FIN3_STORED_PER_CHAIN}"
+
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Validate pilot posterior artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="results/formal_tvp_parts/${FIN3_COUNTRY}/chain_1"
+
+          test -f "${OUT}/formal_tvp_${FIN3_COUNTRY}_chain1.rds" || {
+            echo "::error::Pilot posterior RDS missing."
+            exit 1
+          }
+
+          test -f "${OUT}/00_chain_manifest.csv" || {
+            echo "::error::Pilot chain manifest missing."
+            exit 1
+          }
+
+          test -f "${OUT}/01_equation_summary.csv" || {
+            echo "::error::Pilot equation summary missing."
+            exit 1
+          }
+
+          test -f "${OUT}/02_chain_monitor_summary.csv" || {
+            echo "::error::Pilot monitor summary missing."
+            exit 1
+          }
+
+          Rscript --vanilla -e '
+            country <- Sys.getenv("FIN3_COUNTRY")
+            f <- file.path(
+              "results", "formal_tvp_parts", country, "chain_1",
+              paste0("formal_tvp_", country, "_chain1.rds")
+            )
+            z <- readRDS(f)
+
+            stopifnot(is.matrix(z$monitor))
+            stopifnot(nrow(z$monitor) == as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN")))
+            stopifnot(ncol(z$monitor) > 0)
+            stopifnot(all(is.finite(z$monitor)))
+            stopifnot(dim(z$event_coef)[1] == as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN")))
+            stopifnot(dim(z$event_logvar)[1] == as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN")))
+
+            cat("PILOT POSTERIOR STRUCTURE: PASS\n")
+            cat("monitor dimensions:", dim(z$monitor), "\n")
+            cat("event_coef dimensions:", dim(z$event_coef), "\n")
+            cat("event_logvar dimensions:", dim(z$event_logvar), "\n")
+          '
+
+      - name: Show pilot summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="results/formal_tvp_parts/${FIN3_COUNTRY}/chain_1"
+
+          echo "=== CHAIN MANIFEST ==="
+          test -f "${OUT}/00_chain_manifest.csv" && cat "${OUT}/00_chain_manifest.csv" || true
+
+          echo
+          echo "=== EQUATION SUMMARY ==="
+          test -f "${OUT}/01_equation_summary.csv" && cat "${OUT}/01_equation_summary.csv" || true
+
+          echo
+          echo "=== FORMAL CHAIN README ==="
+          test -f "${OUT}/README_formal_chain.txt" && cat "${OUT}/README_formal_chain.txt" || true
+
+      - name: Upload pilot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-formal-pilot-${{ matrix.country }}-${{ github.run_id }}
+          path: |
+            results/formal_tvp_parts/${{ inputs.country }}/chain_1/
+          if-no-files-found: warn
+          retention-days: 14
