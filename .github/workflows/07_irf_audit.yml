@@ -1,0 +1,321 @@
+name: Financial 3var full transformation and formal IRF audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Optional completed FORMAL IRF workflow run ID; leave blank only if the IRF summary already exists in the checked-out repository"
+        required: false
+        default: ""
+        type: string
+      irf_summary_path:
+        description: "Preferred local path to formal IRF posterior summary CSV"
+        required: false
+        default: "results/formal_irf/irf_posterior_summary.csv"
+        type: string
+      rate_mode:
+        description: "IRF model rate transformation"
+        required: true
+        default: "level"
+        type: choice
+        options:
+          - level
+          - difference
+      equity_return_mode:
+        description: "How EQ_RETURN should be interpreted in cumulative-level language"
+        required: true
+        default: "simple_return"
+        type: choice
+        options:
+          - simple_return
+          - log_return
+      reer_positive_meaning:
+        description: "Meaning of a positive REER_DLOG response"
+        required: true
+        default: "REER appreciation direction"
+        type: string
+      max_flagged_plots:
+        description: "Maximum number of individual flagged IRF plots"
+        required: false
+        default: "100"
+        type: string
+
+jobs:
+  full-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      REQUESTED_IRF_PATH: ${{ inputs.irf_summary_path }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      FIN3_RATE_MODE: ${{ inputs.rate_mode }}
+      FIN3_EQ_RETURN_MODE: ${{ inputs.equity_return_mode }}
+      FIN3_REER_POSITIVE_MEANING: ${{ inputs.reer_positive_meaning }}
+      FIN3_MAX_FLAGGED_PLOTS: ${{ inputs.max_flagged_plots }}
+      FIN3_REQUIRE_TRANSFORM_AUDIT: "1"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Verify required audit scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            "R/00_config.R"
+            "R/10_build_financial_3var_input.R"
+            "R/15_variable_transformation_audit.R"
+            "R/55_irf_significance_audit.R"
+            "R/56_irf_plot_diagnostic.R"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing required file: $f"
+              exit 1
+            }
+            echo "FOUND: $f"
+          done
+
+      - name: Fetch validated source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+
+          git -C source_repo sparse-checkout set 8.12
+
+          required=(
+            "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx"
+            "source_repo/8.12/gpr_quarterly_processed.csv"
+            "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv"
+            "source_repo/8.12/Trade_Weights_14_Economies_2000_2014.csv"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing validated source input: $f"
+              exit 1
+            }
+          done
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install R dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+            any::urca
+            any::ggplot2
+
+      - name: Build clean baseline financial panel
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/10_build_financial_3var_input.R
+
+      - name: Audit variable transformations and rate robustness
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/15_variable_transformation_audit.R
+
+      - name: Show transformation audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== VARIABLE DEFINITIONS ==="
+          cat results/variable_transform/00_variable_definitions.csv
+
+          echo
+          echo "=== STATIONARITY SUMMARY ==="
+          cat results/variable_transform/06_stationarity_summary_by_series.csv
+
+          echo
+          echo "=== SAME-SAMPLE RATE LEVEL VS DELTA-R ==="
+          cat results/variable_transform/09_same_sample_rate_spec_comparison.csv
+
+          echo
+          echo "=== TRANSFORMATION RECOMMENDATION ==="
+          cat results/variable_transform/10_transformation_recommendation.csv
+
+          echo
+          echo "=== TRANSFORMATION INTEGRITY GATE ==="
+          cat results/variable_transform/11_transformation_integrity_gate.csv
+
+      - name: Resolve formal IRF posterior summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Requested local IRF path: ${REQUESTED_IRF_PATH}"
+          echo "Optional source run: ${SOURCE_RUN_ID}"
+
+          # 1) Prefer an already-present requested path.
+          if [ -f "${REQUESTED_IRF_PATH}" ]; then
+            echo "Using existing IRF summary: ${REQUESTED_IRF_PATH}"
+            echo "FIN3_IRF_SUMMARY=${REQUESTED_IRF_PATH}" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+
+          # 2) Otherwise a source run ID is required.
+          if [ -z "${SOURCE_RUN_ID}" ]; then
+            echo "::error::Formal IRF summary is absent and source_run_id is blank."
+            echo "::error::Run the formal TVP-IRF workflow first, then rerun this audit with its run ID."
+            exit 1
+          fi
+
+          mkdir -p prior_irf_artifact
+
+          echo "Available artifacts in source run:"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.expired == false) | [.id,.name] | @tsv'
+
+          # Download every non-expired artifact from the selected run.
+          mapfile -t ARTIFACT_NAMES < <(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts" \
+              --jq '.artifacts[] | select(.expired == false) | .name'
+          )
+
+          if [ "${#ARTIFACT_NAMES[@]}" -eq 0 ]; then
+            echo "::error::No non-expired artifacts found in run ${SOURCE_RUN_ID}."
+            exit 1
+          fi
+
+          for name in "${ARTIFACT_NAMES[@]}"; do
+            echo "Downloading artifact: ${name}"
+            gh run download "${SOURCE_RUN_ID}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name "${name}" \
+              --dir "prior_irf_artifact/${name}"
+          done
+
+          mapfile -t HITS < <(
+            find prior_irf_artifact -type f \
+              \( -name 'irf_posterior_summary.csv' \
+                 -o -name '*irf*posterior*summary*.csv' \
+                 -o -name '*formal*irf*summary*.csv' \) \
+              | sort
+          )
+
+          if [ "${#HITS[@]}" -eq 0 ]; then
+            echo "::error::No compatible formal IRF posterior-summary CSV found in downloaded artifacts."
+            find prior_irf_artifact -maxdepth 5 -type f | sort | sed -n '1,250p'
+            exit 1
+          fi
+
+          if [ "${#HITS[@]}" -gt 1 ]; then
+            echo "::warning::Multiple compatible IRF summary files found:"
+            printf '%s\n' "${HITS[@]}"
+            echo "::warning::The first sorted match will be used. Prefer an unambiguous formal artifact."
+          fi
+
+          SELECTED="${HITS[0]}"
+          echo "Selected IRF summary: ${SELECTED}"
+
+          mkdir -p results/formal_irf
+          cp "${SELECTED}" results/formal_irf/irf_posterior_summary.csv
+
+          echo "FIN3_IRF_SUMMARY=results/formal_irf/irf_posterior_summary.csv" >> "${GITHUB_ENV}"
+
+      - name: Audit IRF significance directions and transformation scale
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/55_irf_significance_audit.R
+
+      - name: Generate transformation-aware IRF figures
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/56_irf_plot_diagnostic.R
+
+      - name: Show IRF audit summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== IRF AUDIT README ==="
+          cat results/irf_audit/README_irf_audit.txt
+
+          echo
+          echo "=== IRF SCALE MANIFEST ==="
+          cat results/irf_audit/00a_irf_variable_scale_manifest.csv
+
+          echo
+          echo "=== VARIABLE DIRECTION SUMMARY ==="
+          cat results/irf_audit/04_irf_variable_direction_summary.csv
+
+          echo
+          echo "=== IRF AUDIT INTEGRITY GATE ==="
+          cat results/irf_audit/05_irf_audit_integrity_gate.csv
+
+          echo
+          echo "=== FLAGGED CASE COUNT ==="
+          Rscript --vanilla -e '
+            f <- "results/irf_audit/02_irf_flagged_cases.csv"
+            d <- read.csv(f, stringsAsFactors = FALSE)
+            cat(nrow(d), "flagged IRF paths\n")
+          '
+
+      - name: Enforce all audit integrity gates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            tg <- read.csv(
+              "results/variable_transform/11_transformation_integrity_gate.csv",
+              stringsAsFactors = FALSE,
+              check.names = FALSE
+            )
+            ig <- read.csv(
+              "results/irf_audit/05_irf_audit_integrity_gate.csv",
+              stringsAsFactors = FALSE,
+              check.names = FALSE
+            )
+
+            if (!all(tg$Pass)) {
+              print(tg)
+              stop("Variable-transformation integrity gate failed.")
+            }
+
+            if (!all(ig$Pass)) {
+              print(ig)
+              stop("IRF numerical audit integrity gate failed.")
+            }
+
+            cat("FULL AUDIT: READY\n")
+          '
+
+      - name: Upload full audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-full-audit-${{ github.run_id }}
+          path: |
+            results/variable_transform/
+            results/irf_audit/
+            data/derived/panel_domestic_fin3.csv
+            data/derived/panel_domestic_fin3_level_common.csv
+            data/derived/panel_domestic_fin3_rate_diff.csv
+          if-no-files-found: warn
+          retention-days: 30
