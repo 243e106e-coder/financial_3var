@@ -1,0 +1,158 @@
+name: Financial 3var TVP hyperparameter grid
+
+on:
+  workflow_dispatch:
+    inputs:
+      draws:
+        description: "FFBS posterior draws per hyperparameter specification"
+        required: false
+        default: "60"
+      min_stable_share:
+        description: "Original posterior stability gate; do not lower just to force READY"
+        required: false
+        default: "0.90"
+
+jobs:
+  tvp-hyperparameter-grid:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      TVP_SMOKE_DRAWS: ${{ github.event.inputs.draws || '60' }}
+      TVP_MIN_STABLE_SHARE: ${{ github.event.inputs.min_stable_share || '0.90' }}
+      TVP_SMOKE_SEED: "20260901"
+      TVP_RIDGE: "0.00000001"
+      TVP_MIN_G0_RCOND: "0.0000000001"
+      TVP_MAX_SPLIT_DIFF: "0.10"
+      TVP_MAX_ABS_STD_BETA: "50"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Fetch validated macro inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+          git -C source_repo sparse-checkout set 8.12
+
+          test -f "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx" \
+            || { echo "::error::Missing macro workbook"; exit 1; }
+          test -f "source_repo/8.12/gpr_quarterly_processed.csv" \
+            || { echo "::error::Missing GPR file"; exit 1; }
+          test -f "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv" \
+            || { echo "::error::Missing Brent file"; exit 1; }
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install input dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+
+      - name: Build clean financial 3-variable panel
+        run: Rscript --vanilla R/10_build_financial_3var_input.R
+
+      - name: Validate financial weights
+        run: Rscript --vanilla R/20_weight_preflight.R
+
+      - name: Reconfirm p1 q1 global stability
+        run: Rscript --vanilla R/30_stability_grid.R
+
+      - name: Reconfirm estimation gate
+        run: Rscript --vanilla R/40_estimation_gate.R
+
+      - name: Run 3x3 TVP shrinkage grid
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          mkdir -p results/tvp_grid
+
+          state_scales=("1e-5" "1e-6" "1e-7")
+          prior_scales=("4" "1" "0.25")
+
+          for state_scale in "${state_scales[@]}"; do
+            for prior_scale in "${prior_scales[@]}"; do
+              state_tag=$(printf '%s' "$state_scale" | sed 's/+//g; s/-/m/g; s/\./p/g')
+              prior_tag=$(printf '%s' "$prior_scale" | sed 's/+//g; s/-/m/g; s/\./p/g')
+              spec_id="state_${state_tag}__prior_${prior_tag}"
+              spec_dir="results/tvp_grid/${spec_id}"
+
+              echo
+              echo "============================================================"
+              echo "Running ${spec_id}"
+              echo "TVP_STATE_SCALE=${state_scale}"
+              echo "TVP_PRIOR_SCALE=${prior_scale}"
+              echo "============================================================"
+
+              rm -rf results/tvp_smoke
+              mkdir -p "$spec_dir"
+
+              export TVP_STATE_SCALE="$state_scale"
+              export TVP_PRIOR_SCALE="$prior_scale"
+
+              set +e
+              Rscript --vanilla R/50_tvp_gvar_smoke_test.R > "${spec_dir}/run.log" 2>&1
+              rc=$?
+              set -e
+
+              cat "${spec_dir}/run.log"
+
+              if [ -d results/tvp_smoke ]; then
+                cp -a results/tvp_smoke/. "$spec_dir/"
+              fi
+
+              cat > "${spec_dir}/RUN_METADATA.csv" <<META
+          StateScale,PriorScale,ExitCode
+          ${state_scale},${prior_scale},${rc}
+          META
+
+              if [ "$rc" -eq 0 ]; then
+                echo "${spec_id}: READY (exit 0)"
+              elif [ "$rc" -eq 2 ]; then
+                echo "${spec_id}: model gate FAIL (expected diagnostic exit 2); continuing grid"
+              else
+                echo "::warning::${spec_id}: operational error exit ${rc}; continuing grid"
+              fi
+            done
+          done
+
+      - name: Summarize hyperparameter grid
+        run: Rscript --vanilla R/51_summarize_tvp_grid.R
+
+      - name: Show grid recommendation
+        if: always()
+        shell: bash
+        run: |
+          echo "=== TVP HYPERPARAMETER GRID ==="
+          cat results/tvp_grid/README_tvp_hyperparameter_grid.txt || true
+          echo
+          echo "=== RECOMMENDED SPECIFICATION ==="
+          cat results/tvp_grid/RECOMMENDED_SPEC.txt || true
+          echo
+          echo "=== GRID SUMMARY ==="
+          if [ -f results/tvp_grid/00_tvp_hyperparameter_grid_summary.csv ]; then
+            Rscript --vanilla -e 'd<-read.csv("results/tvp_grid/00_tvp_hyperparameter_grid_summary.csv",check.names=FALSE); keep<-intersect(c("SpecID","StateScale","PriorScale","ExitCode","GateStatus","PosteriorStableShare","G0OKShare","SplitDifference","WorstCountry","WorstCountryStableShare","WorstQuarter","WorstQuarterStableShare","ReadyCandidate","Recommended"),names(d)); print(d[,keep,drop=FALSE],row.names=FALSE)'
+          fi
+
+      - name: Upload TVP hyperparameter grid artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-tvp-hyperparameter-grid-${{ github.run_id }}
+          path: |
+            data/derived/
+            results/weights/
+            results/stability/
+            results/gate/
+            results/tvp_grid/
+          if-no-files-found: warn
+          retention-days: 30
