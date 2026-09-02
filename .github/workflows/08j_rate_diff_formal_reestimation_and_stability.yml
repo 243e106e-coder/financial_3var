@@ -1,0 +1,607 @@
+name: Financial 3var 08j Delta-r formal re-estimation and stability gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      burn_per_chain:
+        description: "Burn-in iterations per country-chain"
+        required: true
+        default: "5000"
+        type: string
+      postburn_per_chain:
+        description: "Post-burn MCMC iterations per country-chain"
+        required: true
+        default: "10000"
+        type: string
+      stored_per_chain:
+        description: "Strictly post-burn draws stored per country-chain"
+        required: true
+        default: "2000"
+        type: string
+      seed_base:
+        description: "Base seed for Delta-r formal re-estimation"
+        required: true
+        default: "20260920"
+        type: string
+      diagnostic_draws_per_chain:
+        description: "Deterministically thinned draws per chain for posterior dynamic-stability diagnosis"
+        required: true
+        default: "250"
+        type: string
+      diagnostic_cores:
+        description: "Cores used by the posterior dynamic-stability diagnostic"
+        required: true
+        default: "2"
+        type: string
+      max_parallel:
+        description: "Maximum simultaneous country-chain MCMC jobs"
+        required: true
+        default: "14"
+        type: string
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Verify 08j scripts and unchanged formal core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            "R/00_config.R"
+            "R/10_build_financial_3var_input.R"
+            "R/15_variable_transformation_audit.R"
+            "R/53_event_calendar.R"
+            "R/54_build_tvp_irf_targets.R"
+            "R/60_formal_bayesian_tvp_gvar.R"
+            "R/61_formal_mcmc_diagnostics.R"
+            "R/63_posterior_dynamic_stability_source_diagnostic.R"
+            "R/65_rate_diff_formal_decision.R"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing required file: $f"
+              exit 1
+            }
+          done
+
+      - name: Fetch validated source inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
+          git -C source_repo sparse-checkout set 8.12
+
+          required=(
+            "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx"
+            "source_repo/8.12/gpr_quarterly_processed.csv"
+            "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv"
+            "source_repo/8.12/Trade_Weights_14_Economies_2000_2014.csv"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing source input: $f"
+              exit 1
+            }
+          done
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install prepare-stage dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::readxl
+            any::urca
+
+      - name: Build clean baseline panel
+        run: Rscript --vanilla R/10_build_financial_3var_input.R
+
+      - name: Build same-sample Delta-r panel and transformation audit
+        run: Rscript --vanilla R/15_variable_transformation_audit.R
+
+      - name: Build event calendar
+        run: Rscript --vanilla R/53_event_calendar.R
+
+      - name: Build TVP-IRF target grid
+        run: Rscript --vanilla R/54_build_tvp_irf_targets.R
+
+      - name: Enforce Delta-r pre-estimation integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            source("R/00_config.R")
+
+            tg <- read.csv(
+              "results/variable_transform/11_transformation_integrity_gate.csv",
+              stringsAsFactors=FALSE,
+              check.names=FALSE
+            )
+            if (!all(tg$Pass)) {
+              print(tg)
+              stop("Transformation integrity gate failed.")
+            }
+
+            cmp <- read.csv(
+              "results/variable_transform/09_same_sample_rate_spec_comparison.csv",
+              stringsAsFactors=FALSE,
+              check.names=FALSE
+            )
+            z <- cmp[cmp$Network == MAIN_NETWORK, , drop=FALSE]
+            if (nrow(z) != 1L) stop("Missing main-network same-sample comparison.")
+
+            lr <- as.numeric(z$GlobalSpectralRadius_RateLevel[1])
+            dr <- as.numeric(z$GlobalSpectralRadius_RateDiff[1])
+
+            cat(sprintf("Same-sample rate-level static rho: %.8f\n", lr))
+            cat(sprintf("Same-sample Delta-r static rho: %.8f\n", dr))
+
+            if (!is.finite(dr) || dr >= 1) {
+              stop("Delta-r static GVAR is not stable.")
+            }
+            if (!is.finite(lr) || dr >= lr) {
+              stop("Delta-r does not improve the same-sample static spectral radius.")
+            }
+
+            p <- "data/derived/panel_domestic_fin3_rate_diff.csv"
+            if (!file.exists(p)) stop("Delta-r panel was not generated.")
+
+            d <- read.csv(p, stringsAsFactors=FALSE, check.names=FALSE)
+            need <- c("Quarter","Country","r","de","deq","gpr","brent")
+            if (!all(need %in% names(d))) stop("Malformed Delta-r panel.")
+            if (any(!is.finite(as.matrix(d[, c("r","de","deq","gpr","brent")])))) {
+              stop("Non-finite values in Delta-r panel.")
+            }
+
+            cat("08J DELTA-R PRE-ESTIMATION GATE: PASS\n")
+          '
+
+      - name: Upload 08j prepared Delta-r inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ github.run_id }}
+          path: |
+            data/derived/
+            results/variable_transform/
+            results/events/
+          if-no-files-found: error
+          retention-days: 30
+
+  estimate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        country:
+          - AU
+          - BR
+          - CA
+          - CH
+          - CN
+          - EA
+          - UK
+          - JP
+          - KR
+          - NO
+          - SG
+          - TR
+          - US
+          - ZA
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download prepared Delta-r inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ github.run_id }}
+          path: .
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp from clean Linux source build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          rm -rf threshtvp_src
+
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          ACTUAL_SHA="$(git -C threshtvp_src rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${THRESHTVP_SHA}" || {
+            echo "::error::threshtvp checkout SHA mismatch."
+            exit 1
+          }
+
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+          Rscript --vanilla -e '
+            stopifnot(requireNamespace("threshtvp", quietly=TRUE))
+            pkg <- find.package("threshtvp")
+            so <- list.files(
+              file.path(pkg, "libs"),
+              pattern="threshtvp[.]so$",
+              recursive=TRUE,
+              full.names=TRUE
+            )
+            if (length(so) != 1L) {
+              stop("Expected one installed threshtvp.so; found ", length(so))
+            }
+            writeLines(so, "threshtvp_installed_so_path.txt")
+          '
+
+          SO_PATH="$(cat threshtvp_installed_so_path.txt)"
+          file "${SO_PATH}"
+          file "${SO_PATH}" | grep -q 'ELF' || {
+            echo "::error::Newly compiled threshtvp.so is not Linux ELF."
+            exit 1
+          }
+
+      - name: Run formal Delta-r country-chain TVP MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4" || {
+            echo "::error::08j must use kappa0=1e-4."
+            exit 1
+          }
+
+          test "${FIN3_FORMAL_PANEL}" = "data/derived/panel_domestic_fin3_rate_diff.csv" || {
+            echo "::error::08j must estimate the Delta-r panel."
+            exit 1
+          }
+
+          echo "Country=${FIN3_COUNTRY}"
+          echo "Chain=${FIN3_CHAIN_ID}"
+          echo "Panel=${FIN3_FORMAL_PANEL}"
+          echo "Burn=${FIN3_BURN}"
+          echo "Postburn=${FIN3_KEEP}"
+          echo "Stored=${FIN3_STORED_PER_CHAIN}"
+
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Verify posterior part is Delta-r
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            fs <- list.files(
+              file.path("results","formal_tvp_parts",Sys.getenv("FIN3_COUNTRY"),
+                        paste0("chain_",Sys.getenv("FIN3_CHAIN_ID"))),
+              pattern="^formal_tvp_[A-Z]{2}_chain[0-9]+[.]rds$",
+              full.names=TRUE
+            )
+            if (length(fs) != 1L) stop("Expected one posterior RDS.")
+            z <- readRDS(fs)
+            if (basename(z$meta$source_panel) != "panel_domestic_fin3_rate_diff.csv") {
+              stop("Posterior source panel is not Delta-r.")
+            }
+            if (as.integer(z$meta$stored_draws) != as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN"))) {
+              stop("Stored-draw metadata mismatch.")
+            }
+            cat("08J POSTERIOR LINEAGE: DELTA-R CONFIRMED\n")
+          '
+
+      - name: Upload formal Delta-r country-chain posterior part
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-part-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: |
+            results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  diagnose:
+    needs: [prepare, estimate]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download all Delta-r posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08j-rate-diff-part-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: true
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Verify complete 14 x 4 Delta-r posterior grid
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            source("R/00_config.R")
+            fs <- list.files(
+              "posterior_parts",
+              pattern="^formal_tvp_[A-Z]{2}_chain[0-9]+[.]rds$",
+              recursive=TRUE,
+              full.names=TRUE
+            )
+            if (length(fs) != length(COUNTRIES) * 4L) {
+              stop("Expected 56 Delta-r posterior parts; found ", length(fs))
+            }
+
+            ix <- do.call(rbind, lapply(fs, function(f) {
+              z <- readRDS(f)
+              data.frame(
+                Country=as.character(z$meta$country),
+                Chain=as.integer(z$meta$chain),
+                Stored=as.integer(z$meta$stored_draws),
+                SourcePanel=basename(as.character(z$meta$source_panel)),
+                stringsAsFactors=FALSE
+              )
+            }))
+
+            key <- paste(ix$Country, ix$Chain, sep="||")
+            expected <- paste(
+              rep(COUNTRIES, each=4L),
+              rep(1:4, times=length(COUNTRIES)),
+              sep="||"
+            )
+
+            if (anyDuplicated(key) || !setequal(key, expected)) {
+              stop("Incomplete or duplicate country-chain grid.")
+            }
+            if (any(ix$Stored != as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN")))) {
+              stop("Stored-draw mismatch.")
+            }
+            if (any(ix$SourcePanel != "panel_domestic_fin3_rate_diff.csv")) {
+              print(ix[ix$SourcePanel != "panel_domestic_fin3_rate_diff.csv", ])
+              stop("At least one posterior part does not use the Delta-r panel.")
+            }
+
+            cat("08J DELTA-R POSTERIOR GRID: PASS\n")
+          '
+
+      - name: Run formal four-chain MCMC convergence diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61_formal_mcmc_diagnostics.R
+
+      - name: Show Delta-r formal MCMC gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f results/formal_tvp/00_formal_mcmc_gate.csv && \
+            cat results/formal_tvp/00_formal_mcmc_gate.csv || true
+          echo
+          test -f results/formal_tvp/README_formal_mcmc.txt && \
+            cat results/formal_tvp/README_formal_mcmc.txt || true
+
+      - name: Upload Delta-r convergence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-convergence-${{ github.run_id }}
+          path: |
+            results/formal_tvp/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce formal MCMC convergence before stability diagnosis
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            g <- read.csv(
+              "results/formal_tvp/00_formal_mcmc_gate.csv",
+              stringsAsFactors=FALSE,
+              check.names=FALSE
+            )
+            if (nrow(g) != 1L || g$Status[1] != "READY_FOR_FORMAL_IRF") {
+              print(g)
+              stop("Delta-r formal MCMC convergence gate failed.")
+            }
+            cat("08J DELTA-R MCMC: READY\n")
+          '
+
+  dynamic_stability:
+    needs: [prepare, estimate, diagnose]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_CONVERGENCE_DIR: results/formal_tvp
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_DIAG_DRAWS_PER_CHAIN: ${{ inputs.diagnostic_draws_per_chain }}
+      FIN3_DIAG_CORES: ${{ inputs.diagnostic_cores }}
+      FIN3_IRF_MIN_G0_RCOND: "1e-10"
+      FIN3_LOO_COUNTRIES: "ZA,JP,BR,US,SG"
+      FIN3_RATE_DIFF_MIN_ANCHOR_STABLE: "0.90"
+
+    steps:
+      - name: Checkout financial repository
+        uses: actions/checkout@v4
+
+      - name: Download prepared Delta-r inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ github.run_id }}
+          path: .
+
+      - name: Download all Delta-r posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08j-rate-diff-part-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: true
+
+      - name: Download Delta-r convergence artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-convergence-${{ github.run_id }}
+          path: .
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Diagnose posterior global dynamic stability
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/63_posterior_dynamic_stability_source_diagnostic.R
+
+      - name: Run formal Delta-r decision gate
+        id: final_gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/65_rate_diff_formal_decision.R
+
+      - name: Show 08j decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== 08J RATE-DIFF FORMAL GATE ==="
+          test -f results/rate_diff_decision/00_rate_diff_formal_gate.csv && \
+            cat results/rate_diff_decision/00_rate_diff_formal_gate.csv || true
+
+          echo
+          echo "=== CHECKS ==="
+          test -f results/rate_diff_decision/01_rate_diff_formal_checks.csv && \
+            cat results/rate_diff_decision/01_rate_diff_formal_checks.csv || true
+
+          echo
+          echo "=== DYNAMIC STABILITY ==="
+          test -f results/dynamic_stability_source/00_dynamic_stability_source_gate.csv && \
+            cat results/dynamic_stability_source/00_dynamic_stability_source_gate.csv || true
+
+      - name: Upload 08j Delta-r stability and decision artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-stability-decision-${{ github.run_id }}
+          path: |
+            results/dynamic_stability_source/
+            results/rate_diff_decision/
+            results/variable_transform/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce 08j final decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f results/rate_diff_decision/00_rate_diff_formal_gate.csv || {
+            echo "::error::08j final gate file was not created."
+            exit 1
+          }
+
+          Rscript --vanilla -e '
+            g <- read.csv(
+              "results/rate_diff_decision/00_rate_diff_formal_gate.csv",
+              stringsAsFactors=FALSE,
+              check.names=FALSE
+            )
+            if (nrow(g) != 1L || g$Status[1] != "RATE_DIFF_READY_FOR_IRF_RECODE") {
+              print(g)
+              stop("08j Delta-r specification is not ready for the IRF-recode stage.")
+            }
+            cat("08J FINAL: RATE_DIFF_READY_FOR_IRF_RECODE\n")
+          '
