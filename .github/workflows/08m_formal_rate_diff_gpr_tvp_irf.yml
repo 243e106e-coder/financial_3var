@@ -1,0 +1,346 @@
+name: Financial 3var 08m formal Delta-r GPR TVP-GVAR IRF
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_08j_run_id:
+        description: "Original Delta-r formal re-estimation run"
+        required: true
+        default: "33598683599"
+        type: string
+      source_08k_run_id:
+        description: "Targeted long-chain rescue run"
+        required: true
+        default: "33804294933"
+        type: string
+      source_08l_run_id:
+        description: "Accepted NO/TR independent-seed run"
+        required: true
+        default: "33810122490"
+        type: string
+      source_08l_ref:
+        description: "Exact accepted 08l head SHA"
+        required: true
+        default: "ceaacdbaa6a1c4e3887c1ea0d894af533fdeb182"
+        type: string
+      horizon:
+        description: "IRF horizon in quarters"
+        required: true
+        default: "12"
+        type: string
+      gpr_shock_pct:
+        description: "Positive GPR shock in percent"
+        required: true
+        default: "10"
+        type: string
+      irf_cores:
+        description: "Parallel event-anchor workers"
+        required: true
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  formal_irf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN08J: ${{ inputs.source_08j_run_id }}
+      RUN08K: ${{ inputs.source_08k_run_id }}
+      RUN08L: ${{ inputs.source_08l_run_id }}
+      REF08L: ${{ inputs.source_08l_ref }}
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_CONVERGENCE_DIR: results/formal_tvp
+      FIN3_RATE_DIFF_DECISION_DIR: results/rate_diff_decision
+      FIN3_RATE_DIFF_PANEL_BASENAME: panel_domestic_fin3_rate_diff.csv
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: "2000"
+      FIN3_IRF_HORIZON: ${{ inputs.horizon }}
+      FIN3_GPR_SHOCK_PCT: ${{ inputs.gpr_shock_pct }}
+      FIN3_IRF_MIN_STABLE_SHARE: "0.90"
+      FIN3_IRF_MIN_G0_RCOND: "1e-10"
+      FIN3_IRF_CORES: ${{ inputs.irf_cores }}
+      FIN3_RATE_MODE: difference
+      FIN3_EQ_RETURN_MODE: simple_return
+      FIN3_REQUIRE_TRANSFORM_AUDIT: "true"
+      FIN3_IRF_SUMMARY: results/formal_irf_rate_diff/irf_posterior_summary.csv
+
+    steps:
+      - name: Checkout current 08m code
+        uses: actions/checkout@v4
+
+      - name: Verify accepted source runs and formal core lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f R/67_formal_rate_diff_gpr_tvp_irf.R || {
+            echo "::error::Missing R/67_formal_rate_diff_gpr_tvp_irf.R"
+            exit 1
+          }
+
+          J="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08J}")"
+          K="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08K}")"
+          L="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08L}")"
+
+          test "$(jq -r '.status' <<<"${J}")" = "completed" || exit 1
+          test "$(jq -r '.status' <<<"${K}")" = "completed" || exit 1
+          test "$(jq -r '.status' <<<"${L}")" = "completed" || exit 1
+          test "$(jq -r '.conclusion' <<<"${L}")" = "success" || exit 1
+          test "$(jq -r '.head_sha' <<<"${L}")" = "${REF08L}" || exit 1
+          test "$(jq -r '.path' <<<"${L}")" = ".github/workflows/08l_no_tr_independent_seed_mode_audit.yml" || exit 1
+
+          # R67 is a successor to R62. The accepted model and diagnostic core must
+          # not silently change after 08l.
+          git fetch --no-tags origin "${REF08L}" --depth=1
+          git diff --exit-code "${REF08L}" -- \
+            R/00_config.R \
+            R/55_irf_significance_audit.R \
+            R/56_irf_plot_diagnostic.R \
+            R/60_formal_bayesian_tvp_gvar.R \
+            R/61_formal_mcmc_diagnostics.R \
+            R/62_structural_gpr_tvp_irf.R \
+            R/63_posterior_dynamic_stability_source_diagnostic.R \
+            R/65_rate_diff_formal_decision.R || {
+              echo "::error::Accepted formal core differs from 08l source ref."
+              exit 1
+            }
+
+          echo "08M SOURCE RUNS + CORE LINEAGE: PASS"
+
+      - name: Download exact 08j Delta-r prepared inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ inputs.source_08j_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08j_run_id }}
+
+      - name: Download original 08j posterior parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p posterior_parts
+          gh run download "${RUN08J}" \
+            --pattern "financial-3var-08j-rate-diff-part-*" \
+            --dir posterior_parts
+
+      - name: Replace six 08j rescue countries with 08k parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          for cc in AU BR CN NO SG TR; do
+            d=(posterior_parts/financial-3var-08j-rate-diff-part-${cc}-chain*-${RUN08J})
+            test "${#d[@]}" -eq 4 || {
+              echo "::error::Expected four original 08j artifact dirs for ${cc}."
+              exit 1
+            }
+            rm -rf "${d[@]}"
+          done
+
+          gh run download "${RUN08K}" \
+            --pattern "financial-3var-08k-rate-diff-rescue-*" \
+            --dir posterior_parts
+
+      - name: Replace 08k NO/TR with accepted 08l independent-seed parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          for cc in NO TR; do
+            d=(posterior_parts/financial-3var-08k-rate-diff-rescue-${cc}-chain*-${RUN08K})
+            test "${#d[@]}" -eq 4 || {
+              echo "::error::Expected four 08k artifact dirs for ${cc}."
+              exit 1
+            }
+            rm -rf "${d[@]}"
+          done
+
+          gh run download "${RUN08L}" \
+            --pattern "financial-3var-08l-new-seed-*" \
+            --dir posterior_parts
+
+      - name: Download accepted 08l convergence and Delta-r decision artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf accepted_08l_diag accepted_08l_final
+          gh run download "${RUN08L}" \
+            --name "financial-3var-08l-convergence-mode-audit-${RUN08L}" \
+            --dir accepted_08l_diag
+          gh run download "${RUN08L}" \
+            --name "financial-3var-08l-final-stability-decision-${RUN08L}" \
+            --dir accepted_08l_final
+
+          CONV="$(find accepted_08l_diag -type f -name '00_formal_mcmc_gate.csv' -print -quit)"
+          FINAL="$(find accepted_08l_final -type f -name '00_rate_diff_formal_gate.csv' -print -quit)"
+          test -n "${CONV}" || exit 1
+          test -n "${FINAL}" || exit 1
+
+          rm -rf results/formal_tvp results/rate_diff_decision
+          mkdir -p results/formal_tvp results/rate_diff_decision
+          cp -a "$(dirname "${CONV}")/." results/formal_tvp/
+          cp -a "$(dirname "${FINAL}")/." results/rate_diff_decision/
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install IRF audit and plotting dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::ggplot2
+
+      - name: Verify exact accepted 56-part Delta-r lineage before IRF
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            source("R/00_config.R")
+            fs <- list.files("posterior_parts",
+                             pattern="^formal_tvp_[A-Z]{2}_chain[0-9]+[.]rds$",
+                             recursive=TRUE, full.names=TRUE)
+            if (length(fs) != 56L) stop("Expected 56 posterior RDS files; found ", length(fs))
+
+            ix <- do.call(rbind, lapply(fs, function(f) {
+              z <- readRDS(f)
+              data.frame(Country=as.character(z$meta$country),
+                         Chain=as.integer(z$meta$chain),
+                         Burn=as.integer(z$meta$burn),
+                         Keep=as.integer(z$meta$keep_internal),
+                         Stored=as.integer(z$meta$stored_draws),
+                         Panel=basename(as.character(z$meta$source_panel)),
+                         File=f, stringsAsFactors=FALSE)
+            }))
+
+            key <- paste(ix$Country, ix$Chain, sep="||")
+            expected <- paste(rep(COUNTRIES, each=4L), rep(1:4, times=length(COUNTRIES)), sep="||")
+            if (anyDuplicated(key) || !setequal(key, expected)) stop("Country-chain grid mismatch.")
+            if (any(ix$Stored != 2000L)) stop("Stored-draw mismatch.")
+            if (any(ix$Panel != "panel_domestic_fin3_rate_diff.csv")) stop("Non-Delta-r posterior detected.")
+
+            old8 <- c("CA","CH","EA","UK","JP","KR","US","ZA")
+            k4 <- c("AU","BR","CN","SG")
+            new2 <- c("NO","TR")
+            if (nrow(ix[ix$Country %in% old8,]) != 32L) stop("Expected 32 accepted 08j parts.")
+            if (nrow(ix[ix$Country %in% k4,]) != 16L) stop("Expected 16 accepted 08k parts.")
+            if (nrow(ix[ix$Country %in% new2,]) != 8L) stop("Expected 8 accepted 08l parts.")
+            if (any(ix$Burn[ix$Country %in% old8] != 5000L) || any(ix$Keep[ix$Country %in% old8] != 10000L)) stop("08j metadata mismatch.")
+            if (any(ix$Burn[ix$Country %in% c(k4,new2)] != 7500L) || any(ix$Keep[ix$Country %in% c(k4,new2)] != 20000L)) stop("08k/08l metadata mismatch.")
+
+            g <- read.csv("results/formal_tvp/00_formal_mcmc_gate.csv", stringsAsFactors=FALSE)
+            if (g$Status[1] != "READY_FOR_FORMAL_IRF") stop("Accepted R61 gate missing.")
+            d <- read.csv("results/rate_diff_decision/00_rate_diff_formal_gate.csv", stringsAsFactors=FALSE)
+            if (d$Status[1] != "RATE_DIFF_READY_FOR_IRF_RECODE") stop("Accepted R65 Delta-r gate missing.")
+
+            cat("08M ACCEPTED 56-PART LINEAGE: PASS\n")
+          '
+
+      - name: Run formal full-posterior Delta-r GPR IRF
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/67_formal_rate_diff_gpr_tvp_irf.R
+
+      - name: Enforce formal Delta-r IRF gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            g <- read.csv("results/formal_irf_rate_diff/00_formal_rate_diff_irf_gate.csv", stringsAsFactors=FALSE)
+            if (nrow(g) != 1L || g$Status[1] != "READY_FOR_RATE_DIFF_IRF_AUDIT") {
+              print(g); stop("Formal Delta-r IRF gate failed.")
+            }
+            if (g$WorstAnchorStableShare[1] < 0.90) stop("Full-posterior IRF stability below 90%.")
+            if (g$PosteriorFiles[1] != 56L) stop("Posterior lineage file count mismatch.")
+            cat("08M FORMAL DELTA-R IRF: READY_FOR_AUDIT\n")
+          '
+
+      - name: Run transformation-aware IRF significance audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/55_irf_significance_audit.R
+
+      - name: Enforce R55 numeric integrity gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            g <- read.csv("results/irf_audit/05_irf_audit_integrity_gate.csv", stringsAsFactors=FALSE)
+            if (!all(g$Pass)) {
+              print(g); stop("R55 IRF audit integrity gate failed.")
+            }
+            s <- read.csv("results/irf_audit/00a_irf_variable_scale_manifest.csv", stringsAsFactors=FALSE)
+            r <- s[s$ResponseVariable == "r", , drop=FALSE]
+            if (nrow(r) != 1L || r$RuntimeMode[1] != "difference") stop("R55 did not run in Delta-r mode.")
+            cat("08M R55 TRANSFORMATION-AWARE AUDIT: PASS\n")
+          '
+
+      - name: Generate transformation-aware diagnostic IRF plots
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/56_irf_plot_diagnostic.R
+
+      - name: Verify exact draw-level cumulative outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            base <- "results/formal_irf_rate_diff"
+            rf <- file.path(base, "05_cumulative_rate_level_posterior_summary.csv")
+            ef <- file.path(base, "03_cumulative_reer_posterior_summary.csv")
+            if (!file.exists(rf) || !file.exists(ef)) stop("Missing exact cumulative outputs.")
+            r <- read.csv(rf, stringsAsFactors=FALSE)
+            e <- read.csv(ef, stringsAsFactors=FALSE)
+            expected_rows <- 20L * 14L * (as.integer(Sys.getenv("FIN3_IRF_HORIZON")) + 1L)
+            if (nrow(r) != expected_rows) stop("Unexpected cumulative-rate row count: ", nrow(r))
+            if (nrow(e) != expected_rows) stop("Unexpected cumulative-REER row count: ", nrow(e))
+            if (any(!is.finite(r$median)) || any(!is.finite(r$p05)) || any(!is.finite(r$p95))) stop("Non-finite cumulative-rate summaries.")
+            if (any(!is.finite(e$median)) || any(!is.finite(e$p05)) || any(!is.finite(e$p95))) stop("Non-finite cumulative-REER summaries.")
+            if (any(r$p05 > r$median | r$median > r$p95)) stop("Cumulative-rate posterior bands malformed.")
+            if (any(e$p05 > e$median | e$median > e$p95)) stop("Cumulative-REER posterior bands malformed.")
+            cat("08M EXACT DRAW-LEVEL CUMULATIVE OUTPUTS: PASS\n")
+          '
+
+      - name: Show final 08m gates
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== FORMAL DELTA-R IRF GATE ==="
+          cat results/formal_irf_rate_diff/00_formal_rate_diff_irf_gate.csv || true
+          echo
+          echo "=== IRF SCALE MANIFEST ==="
+          cat results/formal_irf_rate_diff/08_irf_scale_manifest.csv || true
+          echo
+          echo "=== R55 INTEGRITY ==="
+          cat results/irf_audit/05_irf_audit_integrity_gate.csv || true
+          echo
+          echo "=== R55 DIRECTION SUMMARY ==="
+          cat results/irf_audit/04_irf_variable_direction_summary.csv || true
+
+      - name: Upload 08m formal IRF results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08m-formal-rate-diff-irf-${{ github.run_id }}
+          path: |
+            results/formal_irf_rate_diff/
+            results/irf_audit/
+          if-no-files-found: error
+          retention-days: 30
