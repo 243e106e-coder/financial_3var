@@ -1,0 +1,576 @@
+name: Financial 3var 08l NO-TR independent-seed mode audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_08j_run_id:
+        description: "Original Delta-r 08j run"
+        required: true
+        default: "33598683599"
+        type: string
+      source_08j_ref:
+        description: "Exact 08j head SHA"
+        required: true
+        default: "13726636f2192987369ad6f8848badd5c960d611"
+        type: string
+      source_08k_run_id:
+        description: "08k targeted-rescue run providing AU/BR/CN/SG accepted long chains and prior diagnostics"
+        required: true
+        default: "33804294933"
+        type: string
+      source_08k_ref:
+        description: "Exact 08k head SHA"
+        required: true
+        default: "4f6b6a1867f2315aa675b982038e86699f46b632"
+        type: string
+      new_seed_base:
+        description: "Completely new seed base for NO/TR independent-seed audit"
+        required: true
+        default: "20261020"
+        type: string
+      burn_per_chain:
+        description: "NO/TR burn-in"
+        required: true
+        default: "7500"
+        type: string
+      postburn_per_chain:
+        description: "NO/TR internal post-burn iterations"
+        required: true
+        default: "20000"
+        type: string
+      stored_per_chain:
+        description: "Stored draws per chain; must stay 2000"
+        required: true
+        default: "2000"
+        type: string
+      diagnostic_draws_per_chain:
+        description: "R63 balanced diagnostic draws per chain"
+        required: true
+        default: "250"
+        type: string
+      diagnostic_cores:
+        description: "R63 cores"
+        required: true
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify_sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN08J: ${{ inputs.source_08j_run_id }}
+      REF08J: ${{ inputs.source_08j_ref }}
+      RUN08K: ${{ inputs.source_08k_run_id }}
+      REF08K: ${{ inputs.source_08k_ref }}
+    steps:
+      - name: Checkout current 08l code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify source runs, lineage, and unchanged core code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          J="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08J}")"
+          K="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08K}")"
+
+          test "$(jq -r '.status' <<<"${J}")" = "completed" || exit 1
+          test "$(jq -r '.head_sha' <<<"${J}")" = "${REF08J}" || exit 1
+          test "$(jq -r '.path' <<<"${J}")" = ".github/workflows/08j_rate_diff_formal_reestimation_and_stability.yml" || exit 1
+
+          test "$(jq -r '.status' <<<"${K}")" = "completed" || exit 1
+          test "$(jq -r '.head_sha' <<<"${K}")" = "${REF08K}" || exit 1
+          test "$(jq -r '.path' <<<"${K}")" = ".github/workflows/08k_rate_diff_targeted_convergence_rescue.yml" || exit 1
+
+          # 08l is allowed to add only its new workflow / R66 around the existing
+          # formal core.  The estimator and diagnostic definitions must be unchanged
+          # relative to the 08k code that produced the source rescue chains.
+          git diff --exit-code "${REF08K}" -- \
+            R/00_config.R \
+            R/60_formal_bayesian_tvp_gvar.R \
+            R/61_formal_mcmc_diagnostics.R \
+            R/63_posterior_dynamic_stability_source_diagnostic.R \
+            R/65_rate_diff_formal_decision.R || {
+              echo "::error::Formal core differs from source 08k ref."
+              exit 1
+            }
+
+          test -f R/66_no_tr_independent_seed_mode_audit.R || exit 1
+
+          AJ="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08J}/artifacts?per_page=100")"
+          AK="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08K}/artifacts?per_page=100")"
+
+          JPARTS="$(jq -r --arg rid "${RUN08J}" '[.artifacts[] | select(.expired == false and (.name | startswith("financial-3var-08j-rate-diff-part-")) and (.name | endswith("-" + $rid)))] | length' <<<"${AJ}")"
+          JINPUT="$(jq -r --arg n "financial-3var-08j-rate-diff-input-${RUN08J}" '[.artifacts[] | select(.expired == false and .name == $n)] | length' <<<"${AJ}")"
+          KPARTS="$(jq -r --arg rid "${RUN08K}" '[.artifacts[] | select(.expired == false and (.name | startswith("financial-3var-08k-rate-diff-rescue-")) and (.name | endswith("-" + $rid)))] | length' <<<"${AK}")"
+          KCONV="$(jq -r --arg n "financial-3var-08k-rate-diff-convergence-${RUN08K}" '[.artifacts[] | select(.expired == false and .name == $n)] | length' <<<"${AK}")"
+
+          echo "08j parts=${JPARTS}; input=${JINPUT}; 08k rescue parts=${KPARTS}; convergence=${KCONV}"
+          test "${JPARTS}" = "56" || exit 1
+          test "${JINPUT}" = "1" || exit 1
+          test "${KPARTS}" = "24" || exit 1
+          test "${KCONV}" = "1" || exit 1
+
+          echo "08L SOURCE INTEGRITY: PASS"
+
+  estimate_new_seed:
+    needs: verify_sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        country: [NO, TR]
+        chain: [1, 2, 3, 4]
+    env:
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.new_seed_base }}
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+    steps:
+      - name: Checkout current 08l code
+        uses: actions/checkout@v4
+
+      - name: Download exact 08j Delta-r prepared input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ inputs.source_08j_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08j_run_id }}
+
+      - name: Verify independent-seed specification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${FIN3_SEED_BASE}" = "20261020" || {
+            echo "::error::First 08l run must use the independent seed base 20261020."
+            exit 1
+          }
+          test "${FIN3_BURN}" = "7500" || exit 1
+          test "${FIN3_KEEP}" = "20000" || exit 1
+          test "${FIN3_STORED_PER_CHAIN}" = "2000" || exit 1
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4" || exit 1
+          test -f "${FIN3_FORMAL_PANEL}" || exit 1
+          echo "country=${FIN3_COUNTRY}; chain=${FIN3_CHAIN_ID}; new seed base=${FIN3_SEED_BASE}"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp
+        shell: bash
+        run: |
+          set -euo pipefail
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          rm -rf threshtvp_src
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+          test "$(git -C threshtvp_src rev-parse HEAD)" = "${THRESHTVP_SHA}" || exit 1
+          find threshtvp_src/src -maxdepth 1 -type f \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) -delete
+          R CMD INSTALL --preclean --clean --no-multiarch --with-keep.source threshtvp_src
+
+      - name: Run NO-TR independent-seed long chain
+        run: Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Validate new-seed posterior metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            cc <- Sys.getenv("FIN3_COUNTRY")
+            ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+            expected_seed_base <- 20261020L
+            source("R/00_config.R")
+            f <- list.files(file.path("results","formal_tvp_parts",cc),
+                            pattern=paste0("^formal_tvp_",cc,"_chain",ch,"[.]rds$"),
+                            recursive=TRUE, full.names=TRUE)
+            if (length(f) != 1L) stop("Expected one posterior.")
+            z <- readRDS(f)
+            expected_seed <- expected_seed_base + 10000L * ch + 101L * match(cc, COUNTRIES)
+            stopifnot(as.integer(z$meta$seed) == expected_seed)
+            stopifnot(as.integer(z$meta$burn) == 7500L)
+            stopifnot(as.integer(z$meta$keep_internal) == 20000L)
+            stopifnot(as.integer(z$meta$stored_draws) == 2000L)
+            stopifnot(basename(as.character(z$meta$source_panel)) == "panel_domestic_fin3_rate_diff.csv")
+            cat("08L NEW-SEED POSTERIOR: PASS\n")
+          '
+
+      - name: Upload NO-TR independent-seed posterior
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08l-new-seed-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  diagnose_and_mode_audit:
+    needs: [verify_sources, estimate_new_seed]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      RUN08J: ${{ inputs.source_08j_run_id }}
+      RUN08K: ${{ inputs.source_08k_run_id }}
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_CONVERGENCE_DIR: results/formal_tvp
+      FIN3_PRIOR_CONVERGENCE_DIR: prior_08k_convergence/formal_tvp
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+      FIN3_MODE_SEPARATION_RATIO: "4"
+    steps:
+      - name: Checkout current 08l code
+        uses: actions/checkout@v4
+
+      - name: Download all original 08j posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08j-rate-diff-part-*-${{ inputs.source_08j_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08j_run_id }}
+
+      - name: Remove all six superseded 08j rescue-country parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for cc in AU BR CN NO SG TR; do
+            d=(posterior_parts/financial-3var-08j-rate-diff-part-${cc}-chain*-${RUN08J})
+            test "${#d[@]}" -eq 4 || exit 1
+            rm -rf "${d[@]}"
+          done
+
+      - name: Download all 24 08k rescued parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08k-rate-diff-rescue-*-${{ inputs.source_08k_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08k_run_id }}
+
+      - name: Remove superseded 08k NO and TR parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for cc in NO TR; do
+            d=(posterior_parts/financial-3var-08k-rate-diff-rescue-${cc}-chain*-${RUN08K})
+            test "${#d[@]}" -eq 4 || exit 1
+            rm -rf "${d[@]}"
+          done
+
+      - name: Download eight new NO-TR independent-seed parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08l-new-seed-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Download prior 08k convergence diagnostics
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08k-rate-diff-convergence-${{ inputs.source_08k_run_id }}
+          path: prior_08k_download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08k_run_id }}
+
+      - name: Normalize prior 08k diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          F="$(find prior_08k_download -type f -name '02_mcmc_country_summary.csv' -print -quit)"
+          test -n "${F}" || exit 1
+          SRC="$(dirname "${F}")"
+          mkdir -p prior_08k_convergence/formal_tvp
+          cp -a "${SRC}/." prior_08k_convergence/formal_tvp/
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: any::posterior
+
+      - name: Verify exact final 56-part lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            source("R/00_config.R")
+            fs <- list.files("posterior_parts",
+                             pattern="^formal_tvp_[A-Z]{2}_chain[0-9]+[.]rds$",
+                             recursive=TRUE, full.names=TRUE)
+            if (length(fs) != 56L) stop("Expected 56 posterior RDS files; found ", length(fs))
+            ix <- do.call(rbind, lapply(fs, function(f) {
+              z <- readRDS(f)
+              data.frame(Country=as.character(z$meta$country),
+                         Chain=as.integer(z$meta$chain),
+                         Seed=as.integer(z$meta$seed),
+                         Burn=as.integer(z$meta$burn),
+                         Keep=as.integer(z$meta$keep_internal),
+                         Stored=as.integer(z$meta$stored_draws),
+                         Panel=basename(as.character(z$meta$source_panel)),
+                         File=f, stringsAsFactors=FALSE)
+            }))
+            key <- paste(ix$Country, ix$Chain, sep="||")
+            expected <- paste(rep(COUNTRIES, each=4L), rep(1:4, times=length(COUNTRIES)), sep="||")
+            if (anyDuplicated(key) || !setequal(key, expected)) stop("Final posterior grid mismatch.")
+            if (any(ix$Stored != 2000L)) stop("Stored-draw mismatch.")
+            if (any(ix$Panel != "panel_domestic_fin3_rate_diff.csv")) stop("Non-Delta-r posterior detected.")
+
+            old8 <- c("CA","CH","EA","UK","JP","KR","US","ZA")
+            k4 <- c("AU","BR","CN","SG")
+            new2 <- c("NO","TR")
+
+            if (nrow(ix[ix$Country %in% old8,]) != 32L) stop("Expected 32 retained 08j parts.")
+            if (nrow(ix[ix$Country %in% k4,]) != 16L) stop("Expected 16 retained 08k rescue parts.")
+            if (nrow(ix[ix$Country %in% new2,]) != 8L) stop("Expected 8 new 08l parts.")
+
+            if (any(ix$Burn[ix$Country %in% old8] != 5000L) ||
+                any(ix$Keep[ix$Country %in% old8] != 10000L)) stop("08j retained metadata mismatch.")
+            if (any(ix$Burn[ix$Country %in% k4] != 7500L) ||
+                any(ix$Keep[ix$Country %in% k4] != 20000L)) stop("08k retained metadata mismatch.")
+            if (any(ix$Burn[ix$Country %in% new2] != 7500L) ||
+                any(ix$Keep[ix$Country %in% new2] != 20000L)) stop("08l new-seed metadata mismatch.")
+
+            dir.create("results/08l_lineage", recursive=TRUE, showWarnings=FALSE)
+            write.csv(ix, "results/08l_lineage/00_final_posterior_lineage.csv", row.names=FALSE)
+            cat("08L FINAL POSTERIOR LINEAGE: PASS\n")
+          '
+
+      - name: Run R61 on final mixed posterior
+        run: Rscript --vanilla R/61_formal_mcmc_diagnostics.R
+
+      - name: Run NO-TR independent-seed mode audit
+        id: mode_audit
+        continue-on-error: true
+        run: Rscript --vanilla R/66_no_tr_independent_seed_mode_audit.R
+
+      - name: Show R61 and mode-audit results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== FORMAL MCMC GATE ==="
+          cat results/formal_tvp/00_formal_mcmc_gate.csv || true
+          echo
+          echo "=== COUNTRY SUMMARY ==="
+          cat results/formal_tvp/02_mcmc_country_summary.csv || true
+          echo
+          echo "=== INDEPENDENT-SEED MODE AUDIT ==="
+          cat results/independent_seed_mode_audit/00_independent_seed_mode_audit_gate.csv || true
+          echo
+          cat results/independent_seed_mode_audit/03_no_tr_country_before_after.csv || true
+
+      - name: Upload 08l convergence and mode-audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08l-convergence-mode-audit-${{ github.run_id }}
+          path: |
+            results/formal_tvp/
+            results/independent_seed_mode_audit/
+            results/08l_lineage/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce R61 plus independent-seed audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            g <- read.csv("results/formal_tvp/00_formal_mcmc_gate.csv", stringsAsFactors=FALSE)
+            m <- read.csv("results/independent_seed_mode_audit/00_independent_seed_mode_audit_gate.csv", stringsAsFactors=FALSE)
+            if (nrow(g) != 1L || g$Status[1] != "READY_FOR_FORMAL_IRF") {
+              print(g); stop("08l final mixed posterior fails R61.")
+            }
+            if (nrow(m) != 1L || m$Status[1] != "INDEPENDENT_SEED_MODE_AUDIT_PASS") {
+              print(m); stop("NO/TR independent-seed mode audit failed.")
+            }
+            cat("08L MCMC + MODE AUDIT: PASS\n")
+          '
+
+  dynamic_stability:
+    needs: [verify_sources, estimate_new_seed, diagnose_and_mode_audit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      RUN08J: ${{ inputs.source_08j_run_id }}
+      RUN08K: ${{ inputs.source_08k_run_id }}
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_CONVERGENCE_DIR: results/formal_tvp
+      FIN3_DYNAMIC_DIR: results/dynamic_stability_source
+      FIN3_TRANSFORM_DIR: results/variable_transform
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_DIAG_DRAWS_PER_CHAIN: ${{ inputs.diagnostic_draws_per_chain }}
+      FIN3_DIAG_CORES: ${{ inputs.diagnostic_cores }}
+      FIN3_IRF_MIN_G0_RCOND: "1e-10"
+      FIN3_LOO_COUNTRIES: "ZA,JP,BR,US,SG"
+      FIN3_RATE_DIFF_MIN_ANCHOR_STABLE: "0.90"
+      FIN3_RATE_DIFF_PANEL_BASENAME: "panel_domestic_fin3_rate_diff.csv"
+    steps:
+      - name: Checkout current 08l code
+        uses: actions/checkout@v4
+
+      - name: Download exact 08j Delta-r prepared input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ inputs.source_08j_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08j_run_id }}
+
+      - name: Rebuild exact accepted posterior lineage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p posterior_parts
+
+          gh run download "${RUN08J}" \
+            --pattern "financial-3var-08j-rate-diff-part-*" \
+            --dir posterior_parts
+
+          shopt -s nullglob
+          for cc in AU BR CN NO SG TR; do
+            d=(posterior_parts/financial-3var-08j-rate-diff-part-${cc}-chain*-${RUN08J})
+            test "${#d[@]}" -eq 4 || exit 1
+            rm -rf "${d[@]}"
+          done
+
+          gh run download "${RUN08K}" \
+            --pattern "financial-3var-08k-rate-diff-rescue-*" \
+            --dir posterior_parts
+
+          for cc in NO TR; do
+            d=(posterior_parts/financial-3var-08k-rate-diff-rescue-${cc}-chain*-${RUN08K})
+            test "${#d[@]}" -eq 4 || exit 1
+            rm -rf "${d[@]}"
+          done
+
+      - name: Download eight accepted new-seed NO-TR parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-08l-new-seed-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Download accepted 08l convergence-mode artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08l-convergence-mode-audit-${{ github.run_id }}
+          path: accepted_diag
+
+      - name: Normalize accepted R61 convergence files
+        shell: bash
+        run: |
+          set -euo pipefail
+          F="$(find accepted_diag -type f -name '00_formal_mcmc_gate.csv' -print -quit)"
+          test -n "${F}" || exit 1
+          SRC="$(dirname "${F}")"
+          rm -rf results/formal_tvp
+          mkdir -p results/formal_tvp
+          cp -a "${SRC}/." results/formal_tvp/
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Run R63 posterior dynamic stability
+        run: Rscript --vanilla R/63_posterior_dynamic_stability_source_diagnostic.R
+
+      - name: Run R65 Delta-r final decision
+        id: final_gate
+        continue-on-error: true
+        run: Rscript --vanilla R/65_rate_diff_formal_decision.R
+
+      - name: Show final stability decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== R63 DYNAMIC STABILITY ==="
+          cat results/dynamic_stability_source/00_dynamic_stability_source_gate.csv || true
+          echo
+          echo "=== R65 DELTA-R FINAL DECISION ==="
+          cat results/rate_diff_decision/00_rate_diff_formal_gate.csv || true
+          echo
+          cat results/rate_diff_decision/01_rate_diff_formal_checks.csv || true
+
+      - name: Upload 08l final stability decision
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08l-final-stability-decision-${{ github.run_id }}
+          path: |
+            results/dynamic_stability_source/
+            results/rate_diff_decision/
+            results/variable_transform/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce final Delta-r decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f results/rate_diff_decision/00_rate_diff_formal_gate.csv || exit 1
+          Rscript --vanilla -e '
+            g <- read.csv("results/rate_diff_decision/00_rate_diff_formal_gate.csv", stringsAsFactors=FALSE)
+            if (nrow(g) != 1L || g$Status[1] != "RATE_DIFF_READY_FOR_IRF_RECODE") {
+              print(g); stop("08l Delta-r specification is not ready for IRF recode.")
+            }
+            cat("08L FINAL: RATE_DIFF_READY_FOR_IRF_RECODE\n")
+          '
