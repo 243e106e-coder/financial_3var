@@ -1,0 +1,159 @@
+name: Financial 3var 08n event heterogeneity safe-haven TR audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_08m_run_id:
+        description: "Accepted formal Delta-r IRF run"
+        required: true
+        default: "33814426556"
+        type: string
+      source_08m_ref:
+        description: "Exact accepted 08m head SHA"
+        required: true
+        default: "61d89441943a7d57c042cbef3d0bb3ce18359a4b"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN08M: ${{ inputs.source_08m_run_id }}
+      REF08M: ${{ inputs.source_08m_ref }}
+      FIN3_08M_ROOT: source_08m
+      FIN3_08M_RUN_ID: ${{ inputs.source_08m_run_id }}
+      FIN3_08M_HEAD_SHA: ${{ inputs.source_08m_ref }}
+      FIN3_08N_OUT: results/event_heterogeneity_safe_haven_tr_audit
+
+    steps:
+      - name: Checkout current 08n code
+        uses: actions/checkout@v4
+
+      - name: Verify exact accepted 08m source lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f R/68_event_heterogeneity_safe_haven_tr_audit.R || {
+            echo "::error::Missing R/68_event_heterogeneity_safe_haven_tr_audit.R"
+            exit 1
+          }
+
+          J="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08M}")"
+
+          test "$(jq -r '.status' <<<"${J}")" = "completed" || {
+            echo "::error::08m source run is not completed."
+            exit 1
+          }
+          test "$(jq -r '.conclusion' <<<"${J}")" = "success" || {
+            echo "::error::08m source run did not conclude success."
+            exit 1
+          }
+          test "$(jq -r '.head_sha' <<<"${J}")" = "${REF08M}" || {
+            echo "::error::08m source head SHA mismatch."
+            exit 1
+          }
+          test "$(jq -r '.path' <<<"${J}")" = ".github/workflows/08m_formal_rate_diff_gpr_tvp_irf.yml" || {
+            echo "::error::Source run is not the accepted 08m workflow."
+            exit 1
+          }
+
+          A="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08M}/artifacts")"
+          N="$(jq -r --arg name "financial-3var-08m-formal-rate-diff-irf-${RUN08M}" \
+            '[.artifacts[] | select(.name == $name and .expired == false)] | length' <<<"${A}")"
+          test "${N}" = "1" || {
+            echo "::error::Expected exactly one non-expired accepted 08m artifact; found ${N}."
+            exit 1
+          }
+
+          echo "08N EXACT 08M SOURCE LINEAGE: PASS"
+
+      - name: Download accepted 08m artifact only
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08m-formal-rate-diff-irf-${{ inputs.source_08m_run_id }}
+          path: source_08m
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08m_run_id }}
+
+      - name: Enforce source-only 08n contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f source_08m/formal_irf_rate_diff/00_formal_rate_diff_irf_gate.csv
+          test -f source_08m/formal_irf_rate_diff/irf_posterior_summary.csv
+          test -f source_08m/formal_irf_rate_diff/07_core_event_cumulative_reer.csv
+          test -f source_08m/formal_irf_rate_diff/06_core_event_cumulative_rate_level.csv
+          test -f source_08m/irf_audit/05_irf_audit_integrity_gate.csv
+          test -f source_08m/irf_audit/04_irf_variable_direction_summary.csv
+
+          if find source_08m -type f \( -name '*.rds' -o -name '*.RData' -o -name '*.rda' \) | grep -q .; then
+            echo "::error::08m analysis artifact unexpectedly contains posterior/state binary files."
+            exit 1
+          fi
+
+          echo "08N SOURCE-ONLY CONTRACT: PASS"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Run 08n event heterogeneity safe-haven TR audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/68_event_heterogeneity_safe_haven_tr_audit.R
+
+      - name: Enforce 08n diagnostic gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            f <- "results/event_heterogeneity_safe_haven_tr_audit/00_08n_gate.csv"
+            if (!file.exists(f)) stop("Missing 08n gate.")
+            g <- read.csv(f, stringsAsFactors=FALSE, check.names=FALSE)
+            if (nrow(g) != 1L || g$Status[1] != "DIAGNOSTIC_COMPLETE") {
+              print(g)
+              stop("08n diagnostic gate failed.")
+            }
+            if (as.character(g$Source08mRunID[1]) != Sys.getenv("FIN3_08M_RUN_ID")) {
+              stop("08n source run ID mismatch.")
+            }
+            if (as.character(g$Source08mHeadSHA[1]) != Sys.getenv("FIN3_08M_HEAD_SHA")) {
+              stop("08n source head SHA mismatch.")
+            }
+            if (isTRUE(g$PairwiseEventDifferencePosteriorAvailable[1])) {
+              stop("08n must not claim paired event-difference posterior availability.")
+            }
+            if (isTRUE(g$DirectTVPCoefficientVariationIdentified[1])) {
+              stop("08n must not claim direct latent TVP coefficient variation from 08m summaries.")
+            }
+            cat("08N DIAGNOSTIC GATE: PASS\n")
+            print(g)
+          '
+
+      - name: List 08n outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          find results/event_heterogeneity_safe_haven_tr_audit -maxdepth 2 -type f -print | sort
+
+      - name: Upload 08n diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08n-event-heterogeneity-safe-haven-tr-${{ github.run_id }}
+          path: results/event_heterogeneity_safe_haven_tr_audit
+          if-no-files-found: error
+          retention-days: 30
