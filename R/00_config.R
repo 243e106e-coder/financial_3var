@@ -4,13 +4,48 @@ COUNTRIES <- c("AU","BR","CA","CH","CN","EA","UK","JP","KR","NO","SG","TR","US",
 VARS <- c("r","de","deq")
 SOURCE_SUFFIX <- c(r="RATE_LEVEL", de="REER_DLOG", deq="EQ_RETURN")
 
-MAIN_NETWORK <- "main_restated_exdom_2017"
+# =============================================================================
+# NETWORK REGISTRY
+# =============================================================================
+# Existing GCAP networks remain the default so old workflows do not silently
+# change. Trade networks are registered only when the audited files exist.
+# The new trade production workflow sets FIN3_NETWORK=trade_2000_2012.
+#
+# This lets one validated model core estimate multiple network specifications
+# without copying R/60, R/61, R/63 or R/67.
+# =============================================================================
+
+DEFAULT_NETWORK <- "main_restated_exdom_2017"
+
 WEIGHT_FILES <- c(
   main_restated_exdom_2017 = "data/weights/W_main_restated_exdom_2017.csv",
   residency_2017 = "data/weights/W_residency_2017.csv",
   equity_restated_2017 = "data/weights/W_equity_restated_2017.csv",
   bonds_restated_2017 = "data/weights/W_bonds_restated_2017.csv"
 )
+
+OPTIONAL_WEIGHT_FILES <- c(
+  trade_2000_2012 = "data/weights/W_trade_2000_2012.csv",
+  trade_2000_2014_mirror = "data/weights/W_trade_2000_2014_mirror.csv"
+)
+
+for (nm in names(OPTIONAL_WEIGHT_FILES)) {
+  if (file.exists(OPTIONAL_WEIGHT_FILES[[nm]])) {
+    WEIGHT_FILES[[nm]] <- OPTIONAL_WEIGHT_FILES[[nm]]
+  }
+}
+
+NETWORK_ROLES <- c(
+  main_restated_exdom_2017 = "FINANCIAL_GCAP_NATIONALITY_RESTATED_2017",
+  residency_2017 = "FINANCIAL_GCAP_RESIDENCY_2017",
+  equity_restated_2017 = "FINANCIAL_GCAP_EQUITY_2017",
+  bonds_restated_2017 = "FINANCIAL_GCAP_BONDS_2017",
+  trade_2000_2012 = "TRADE_BASELINE_CANDIDATE_2000_2012",
+  trade_2000_2014_mirror = "TRADE_ROBUSTNESS_2000_2014_WITH_DOCUMENTED_2013_2014_MIRROR_COMPLETION"
+)
+
+NETWORK_OVERRIDE <- trimws(Sys.getenv("FIN3_NETWORK", ""))
+MAIN_NETWORK <- if (nzchar(NETWORK_OVERRIDE)) NETWORK_OVERRIDE else DEFAULT_NETWORK
 
 SOURCE_DIR <- Sys.getenv("FIN3_SOURCE_DIR", "source_repo/8.12")
 MACRO_PATH <- Sys.getenv(
@@ -40,6 +75,21 @@ stopf <- function(...) stop(sprintf(...), call. = FALSE)
 msg <- function(...) cat(sprintf(...), "\n")
 num <- function(x) suppressWarnings(as.numeric(as.character(x)))
 
+network_path <- function(network = MAIN_NETWORK) {
+  if (!(network %in% names(WEIGHT_FILES))) {
+    expected <- c(names(WEIGHT_FILES), setdiff(names(OPTIONAL_WEIGHT_FILES), names(WEIGHT_FILES)))
+    stopf(
+      "Requested network '%s' is not available. Available/expected: %s. If this is a trade network, run R/21_prepare_trade_weight_candidates.R first.",
+      network, paste(expected, collapse=", ")
+    )
+  }
+  WEIGHT_FILES[[network]]
+}
+
+network_role <- function(network = MAIN_NETWORK) {
+  if (network %in% names(NETWORK_ROLES)) NETWORK_ROLES[[network]] else "UNCLASSIFIED"
+}
+
 quarter_id <- function(x) {
   sx <- toupper(trimws(as.character(x)))
   out <- rep(NA_integer_, length(sx))
@@ -61,10 +111,12 @@ quarter_label <- function(qid) {
 }
 
 read_weight_matrix <- function(path, normalize = TRUE) {
-  if (!file.exists(path)) stopf("Weight file not found: %s", path)
+  if (length(path) != 1L || is.na(path) || !nzchar(path) || !file.exists(path)) {
+    stopf("Weight file not found: %s", paste(path, collapse=","))
+  }
   d <- read.csv(path, check.names=FALSE, stringsAsFactors=FALSE,
                 fileEncoding="UTF-8-BOM")
-  names(d) <- trimws(names(d))
+  names(d) <- trimws(sub("^\ufeff", "", names(d)))
   rr <- toupper(trimws(as.character(d[[1]])))
   cc <- toupper(trimws(names(d)[-1]))
   if (!all(COUNTRIES %in% rr) || !all(COUNTRIES %in% cc)) {
@@ -76,8 +128,8 @@ read_weight_matrix <- function(path, normalize = TRUE) {
     ri <- match(i, rr)
     for (j in COUNTRIES) W[i,j] <- num(d[[match(j,cc)+1L]][ri])
   }
-  if (any(!is.finite(W))) stopf("Non-finite financial weight in %s", path)
-  if (any(W < -1e-12)) stopf("Negative financial weight in %s", path)
+  if (any(!is.finite(W))) stopf("Non-finite weight in %s", path)
+  if (any(W < -1e-12)) stopf("Negative weight in %s", path)
   if (max(abs(diag(W))) > 1e-8) stopf("Non-zero diagonal in %s", path)
   if (any(rowSums(W) <= 0)) stopf("Non-positive row sum in %s", path)
   if (normalize) {
