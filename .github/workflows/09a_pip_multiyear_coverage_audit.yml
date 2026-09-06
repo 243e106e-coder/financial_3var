@@ -46,19 +46,66 @@ jobs:
           r-version: "4.4.2"
           use-public-rspm: true
 
-      - name: Install current rsdmx with IMF_DATA provider
+      - name: Install current rsdmx without GitHub API credentials
         shell: bash
         run: |
           set -euo pipefail
+
           Rscript --vanilla -e '
-            install.packages("remotes", repos="https://cloud.r-project.org")
-            remotes::install_github("opensdmx/rsdmx", upgrade="never")
+            install.packages("rsdmx", repos="https://cloud.r-project.org")
+            stopifnot(requireNamespace("rsdmx", quietly=TRUE))
+          '
+
+          curl \
+            --fail \
+            --location \
+            --retry 4 \
+            --retry-all-errors \
+            --connect-timeout 20 \
+            --max-time 180 \
+            --user-agent "financial_3var-pip-audit/1.0" \
+            "https://codeload.github.com/eblondel/rsdmx/tar.gz/refs/heads/master" \
+            --output /tmp/rsdmx-master.tar.gz
+
+          test -s /tmp/rsdmx-master.tar.gz
+
+          R CMD INSTALL /tmp/rsdmx-master.tar.gz
+
+          Rscript --vanilla -e '
             stopifnot(requireNamespace("rsdmx", quietly=TRUE))
             p <- rsdmx::getSDMXServiceProviders()
-            ids <- vapply(methods::slot(p,"providers"), function(x) methods::slot(x,"agencyId"), "")
-            if (!("IMF_DATA" %in% ids)) stop("Installed rsdmx does not contain IMF_DATA provider.")
+            ids <- vapply(
+              methods::slot(p, "providers"),
+              function(x) methods::slot(x, "agencyId"),
+              ""
+            )
+            cat("Installed rsdmx:", as.character(utils::packageVersion("rsdmx")), "\n")
+            cat("Providers include IMF_DATA:", "IMF_DATA" %in% ids, "\n")
+            if (!("IMF_DATA" %in% ids)) {
+              stop("Installed rsdmx does not contain the IMF_DATA provider.")
+            }
             cat("RSDMX IMF_DATA PROVIDER: PASS\n")
           '
+
+      - name: Probe IMF public SDMX endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 20 \
+            --max-time 120 \
+            --user-agent "financial_3var-pip-audit/1.0" \
+            -H "Accept: application/vnd.sdmx.structure+xml;version=2.1" \
+            "https://api.imf.org/external/sdmx/2.1/datastructure/all/DSD_PIP/latest/?references=descendants" \
+            --output /tmp/pip_dsd_probe.xml
+
+          test -s /tmp/pip_dsd_probe.xml
+          echo "IMF PIP SDMX ENDPOINT: REACHABLE"
 
       - name: Run strict official IMF PIP coverage audit
         shell: bash
@@ -75,15 +122,24 @@ jobs:
             if (!file.exists(f)) stop("Missing PIP coverage gate.")
             g <- read.csv(f, stringsAsFactors=FALSE, check.names=FALSE)
             if (nrow(g) != 1L) stop("Malformed gate.")
-            if (!grepl("^AUDIT_COMPLETE_", g$Status[1])) stop("PIP audit did not complete.")
+            if (!grepl("^AUDIT_COMPLETE_", g$Status[1])) {
+              stop("PIP audit did not complete.")
+            }
+
             forbidden <- c(
-              "MissingTreatedAsZero","SuppressedTreatedAsZero",
-              "NegativePairClippedToZero","MirrorImputationUsed",
-              "InterpolationUsed","CarryForwardUsed"
+              "MissingTreatedAsZero",
+              "SuppressedTreatedAsZero",
+              "NegativePairClippedToZero",
+              "MirrorImputationUsed",
+              "InterpolationUsed",
+              "CarryForwardUsed"
             )
             for (x in forbidden) {
-              if (isTRUE(g[[x]][1])) stop("Forbidden data treatment activated: ", x)
+              if (isTRUE(g[[x]][1])) {
+                stop("Forbidden data treatment activated: ", x)
+              }
             }
+
             cat("09A NO-IMPUTATION CONTRACT: PASS\n")
             print(g)
           '
@@ -93,20 +149,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== PIP COVERAGE GATE ==="
-          cat results/pip_multiyear_coverage_audit/00_pip_coverage_gate.csv || true
-          echo
-          echo "=== YEAR COVERAGE ==="
-          cat results/pip_multiyear_coverage_audit/07_year_coverage_summary.csv || true
-          echo
-          echo "=== COUNTRY-YEAR ROW COVERAGE ==="
-          cat results/pip_multiyear_coverage_audit/08_country_year_row_coverage.csv || true
-          echo
-          echo "=== FIRST MISSING/AMBIGUOUS/NEGATIVE CELLS ==="
-          head -n 41 results/pip_multiyear_coverage_audit/06_missing_ambiguous_negative_underlying_cells.csv || true
+
+          if [ -f results/pip_multiyear_coverage_audit/00_pip_coverage_gate.csv ]; then
+            echo "=== PIP COVERAGE GATE ==="
+            cat results/pip_multiyear_coverage_audit/00_pip_coverage_gate.csv
+            echo
+          fi
+
+          if [ -f results/pip_multiyear_coverage_audit/07_year_coverage_summary.csv ]; then
+            echo "=== YEAR COVERAGE ==="
+            cat results/pip_multiyear_coverage_audit/07_year_coverage_summary.csv
+            echo
+          fi
+
+          if [ -f results/pip_multiyear_coverage_audit/08_country_year_row_coverage.csv ]; then
+            echo "=== COUNTRY-YEAR ROW COVERAGE ==="
+            cat results/pip_multiyear_coverage_audit/08_country_year_row_coverage.csv
+            echo
+          fi
+
+          if [ -f results/pip_multiyear_coverage_audit/06_missing_ambiguous_negative_underlying_cells.csv ]; then
+            echo "=== FIRST MISSING/AMBIGUOUS/NEGATIVE CELLS ==="
+            head -n 41 results/pip_multiyear_coverage_audit/06_missing_ambiguous_negative_underlying_cells.csv
+          fi
 
       - name: Upload strict PIP coverage artifact
-        if: always()
+        if: ${{ always() && hashFiles('results/pip_multiyear_coverage_audit/**') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: financial-3var-09a-pip-multiyear-coverage-${{ github.run_id }}
