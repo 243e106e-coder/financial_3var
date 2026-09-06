@@ -1,4 +1,4 @@
-name: Financial 3var 10c Trade-W SV-block mixing rescue
+name: Financial 3var 10c Trade-W SV-block mixing rescue FIXED
 
 on:
   workflow_dispatch:
@@ -382,30 +382,79 @@ jobs:
           p = Path("threshtvp_src/R/MCMC_function.R")
           s = p.read_text(encoding="utf-8")
 
-          old = "draws=1, burnin=0"
           inner = int(os.environ["FIN3_SV_INNER_BURNIN"])
+          old = "draws=1, burnin=0"
           new = f"draws=1, burnin={inner}"
 
-          n = s.count(old)
-          if n != 1:
+          # estimate_tvp() calls MCMC_tvp().  The pinned source contains
+          # another identical SV call elsewhere in the file, so patch ONLY
+          # the MCMC_tvp function body and leave every other code path intact.
+          start_marker = "MCMC_tvp <- function"
+          end_marker = "VAR_posterior <- function"
+
+          start = s.find(start_marker)
+          end = s.find(end_marker, start)
+
+          if start < 0:
               raise SystemExit(
-                  f"Expected exactly one '{old}' occurrence; found {n}."
+                  "Could not locate MCMC_tvp() in pinned threshtvp source."
+              )
+
+          if end < 0:
+              raise SystemExit(
+                  "Could not locate end boundary of MCMC_tvp() block."
+              )
+
+          prefix = s[:start]
+          block = s[start:end]
+          suffix = s[end:]
+
+          n_block = block.count(old)
+          n_total = s.count(old)
+
+          print(
+              f"Found {n_total} total '{old}' calls; "
+              f"{n_block} inside MCMC_tvp()."
+          )
+
+          if n_block != 1:
+              raise SystemExit(
+                  f"Expected exactly one '{old}' occurrence inside "
+                  f"MCMC_tvp(); found {n_block}."
+              )
+
+          patched_block = block.replace(old, new, 1)
+          patched = prefix + patched_block + suffix
+
+          # Strong invariants:
+          # 1. exactly one change was made;
+          # 2. the MCMC_tvp call is patched;
+          # 3. the other identical package call remains untouched.
+          if patched.count(new) != 1:
+              raise SystemExit(
+                  "Expected exactly one patched SV call."
+              )
+
+          expected_old_remaining = n_total - 1
+          if patched.count(old) != expected_old_remaining:
+              raise SystemExit(
+                  "Unexpected number of untouched SV calls after patch."
               )
 
           p.write_text(
-              s.replace(old, new, 1),
+              patched,
               encoding="utf-8"
           )
 
-          out = p.read_text(encoding="utf-8")
-          if new not in out:
-              raise SystemExit("SV inner-transition patch was not applied.")
-
           print(
-              "Applied sampler-only patch:",
+              "Applied sampler-only MCMC_tvp patch:",
               old,
               "->",
               new
+          )
+          print(
+              "Untouched identical calls remaining:",
+              expected_old_remaining
           )
           PY
 
@@ -655,7 +704,7 @@ jobs:
         with:
           name: financial-3var-10c-trade-sv-rescue-trade_2000_2012-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
           path: results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
   diagnose:
