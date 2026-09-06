@@ -1,0 +1,199 @@
+name: Financial 3var 08p TR data design forensic audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_08j_run_id:
+        description: "Delta-r prepared-input source run"
+        required: true
+        default: "33598683599"
+        type: string
+      source_08o_run_id:
+        description: "Accepted TR h1 source/TVP audit run"
+        required: true
+        default: "34008483660"
+        type: string
+      source_08o_ref:
+        description: "Exact accepted 08o head SHA"
+        required: true
+        default: "9ab79b1c7e46a408575841ac31e1ed2fe8dde64c"
+        type: string
+      rolling_window:
+        description: "Static diagnostic rolling window in quarters"
+        required: true
+        default: "40"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN08J: ${{ inputs.source_08j_run_id }}
+      RUN08O: ${{ inputs.source_08o_run_id }}
+      REF08O: ${{ inputs.source_08o_ref }}
+
+      FIN3_08J_RUN_ID: ${{ inputs.source_08j_run_id }}
+      FIN3_08O_RUN_ID: ${{ inputs.source_08o_run_id }}
+      FIN3_08O_HEAD_SHA: ${{ inputs.source_08o_ref }}
+
+      FIN3_08P_PANEL: data/derived/panel_domestic_fin3_rate_diff.csv
+      FIN3_08O_ROOT: source_08o
+      FIN3_08P_OUT: results/tr_data_design_forensic
+      FIN3_GPR_SHOCK_PCT: "10"
+      FIN3_08P_ROLLING_WINDOW: ${{ inputs.rolling_window }}
+      FIN3_08P_ROBUST_Z_CUTOFF: "3.5"
+      FIN3_08P_VIF_FLAG: "10"
+      FIN3_08P_LOO_REL_CHANGE_FLAG: "0.25"
+      FIN3_08P_TOPK_REL_CHANGE_FLAG: "0.50"
+
+    steps:
+      - name: Checkout current 08p code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify accepted 08o lineage and unchanged design code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f R/70_tr_data_design_forensic_audit.R || {
+            echo "::error::Missing R/70_tr_data_design_forensic_audit.R"
+            exit 1
+          }
+
+          O="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08O}")"
+
+          test "$(jq -r '.status' <<<"${O}")" = "completed" || {
+            echo "::error::08o source is not completed."
+            exit 1
+          }
+          test "$(jq -r '.conclusion' <<<"${O}")" = "success" || {
+            echo "::error::08o source did not succeed."
+            exit 1
+          }
+          test "$(jq -r '.head_sha' <<<"${O}")" = "${REF08O}" || {
+            echo "::error::08o source head SHA mismatch."
+            exit 1
+          }
+          test "$(jq -r '.path' <<<"${O}")" = ".github/workflows/08o_tr_h1_source_and_tvp_coefficient_audit.yml" || {
+            echo "::error::Source run is not 08o."
+            exit 1
+          }
+
+          # 08p reconstructs the exact R/60 static design. These files may not
+          # silently drift from the accepted 08o repository state.
+          git diff --exit-code "${REF08O}" -- \
+            R/00_config.R \
+            R/60_formal_bayesian_tvp_gvar.R || {
+              echo "::error::Current config/R60 design differs from accepted 08o ref."
+              exit 1
+            }
+
+          echo "08P ACCEPTED SOURCE + DESIGN LINEAGE: PASS"
+
+      - name: Download exact Delta-r prepared input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ inputs.source_08j_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08j_run_id }}
+
+      - name: Download accepted 08o artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08o-tr-h1-source-tvp-audit-${{ inputs.source_08o_run_id }}
+          path: source_08o
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08o_run_id }}
+
+      - name: Verify 08p source files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f source_08o/00_08o_gate.csv
+          test -f source_08o/09_tr_de_core_event_coefficients.csv
+          test -f source_08o/14_claims_guardrail.csv
+          test -f data/weights/W_main_restated_exdom_2017.csv
+
+          echo "08P SOURCE FILES: PASS"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Run TR data/design forensic audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/70_tr_data_design_forensic_audit.R
+
+      - name: Enforce 08p integrity gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            f <- "results/tr_data_design_forensic/00_08p_gate.csv"
+            if (!file.exists(f)) stop("Missing 08p gate.")
+            g <- read.csv(f, stringsAsFactors=FALSE, check.names=FALSE)
+
+            if (nrow(g) != 1L || g$Status[1] != "DATA_DESIGN_AUDIT_COMPLETE") {
+              print(g)
+              stop("08p did not complete.")
+            }
+            if (g$FWL_OLS_AbsoluteGap[1] > 1e-10) {
+              stop("FWL does not reconcile with full OLS.")
+            }
+            if (isTRUE(g$ReestimationPerformed[1])) stop("08p must not run MCMC.")
+            if (isTRUE(g$ModelSpecificationChanged[1])) stop("08p must not change model.")
+            if (isTRUE(g$WeightMatrixChanged[1])) stop("08p must not change W.")
+            if (isTRUE(g$AutomaticObservationDeletion[1])) stop("08p must not auto-delete observations.")
+
+            cat("08P INTEGRITY GATE: PASS\n")
+            print(g)
+          '
+
+      - name: Show compact 08p findings
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== 08P GATE ==="
+          cat results/tr_data_design_forensic/00_08p_gate.csv || true
+          echo
+
+          echo "=== FORENSIC SUMMARY ==="
+          cat results/tr_data_design_forensic/10_forensic_summary_metrics.csv || true
+          echo
+
+          echo "=== TOP INFLUENTIAL QUARTERS ==="
+          head -n 21 results/tr_data_design_forensic/03_top_influential_quarters.csv || true
+          echo
+
+          echo "=== STATIC VS POSTERIOR ==="
+          cat results/tr_data_design_forensic/09_static_vs_posterior_scale_comparison.csv || true
+
+      - name: Upload 08p forensic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08p-tr-data-design-forensic-${{ github.run_id }}
+          path: results/tr_data_design_forensic
+          if-no-files-found: error
+          retention-days: 30
