@@ -1,10 +1,10 @@
-name: Financial 3var TVP-GVAR smoke test
+name: Financial 3var Delta-r TVP-GVAR smoke test
 
 on:
   workflow_dispatch:
     inputs:
       draws:
-        description: "FFBS posterior draws for the smoke test"
+        description: "FFBS posterior draws for the Delta-r smoke test"
         required: false
         default: "60"
       state_scale:
@@ -15,23 +15,20 @@ on:
         description: "Minimum posterior draw-quarter share with global spectral radius < 1"
         required: false
         default: "0.90"
-  push:
-    paths:
-      - "R/00_config.R"
-      - "R/10_build_financial_3var_input.R"
-      - "R/20_weight_preflight.R"
-      - "R/30_stability_grid.R"
-      - "R/40_estimation_gate.R"
-      - "R/50_tvp_gvar_smoke_test.R"
-      - "data/weights/**"
-      - ".github/workflows/03_tvp_gvar_smoke_test.yml"
+
+permissions:
+  contents: read
 
 jobs:
-  tvp-smoke:
+  tvp-smoke-rate-diff:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     env:
+      # This diagnostic is deliberately tied to the accepted financial baseline.
+      # The separate workflow 10 handles trade-W production estimation.
+      FIN3_NETWORK: "main_restated_exdom_2017"
+
       TVP_SMOKE_DRAWS: ${{ github.event.inputs.draws || '60' }}
       TVP_STATE_SCALE: ${{ github.event.inputs.state_scale || '0.00001' }}
       TVP_MIN_STABLE_SHARE: ${{ github.event.inputs.min_stable_share || '0.90' }}
@@ -50,16 +47,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          rm -rf source_repo
           git clone --depth 1 --filter=blob:none --sparse \
             https://github.com/243e106e-coder/tvp-gvar-replication-private.git source_repo
           git -C source_repo sparse-checkout set 8.12
 
-          test -f "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx" \
-            || { echo "::error::Missing macro workbook"; exit 1; }
-          test -f "source_repo/8.12/gpr_quarterly_processed.csv" \
-            || { echo "::error::Missing GPR file"; exit 1; }
-          test -f "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv" \
-            || { echo "::error::Missing Brent file"; exit 1; }
+          required=(
+            "source_repo/8.12/TVP_GVAR_14经济体_5变量_2000Q1_2026Q2_处理完成.xlsx"
+            "source_repo/8.12/gpr_quarterly_processed.csv"
+            "source_repo/8.12/IMF_Brent_quarterly_log_2000Q1_2026Q2.csv"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing required source input: $f"
+              exit 1
+            }
+          done
 
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
@@ -67,52 +72,260 @@ jobs:
           r-version: "4.4.2"
           use-public-rspm: true
 
-      - name: Install input dependency
+      - name: Install dependencies
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
           packages: |
             any::readxl
+            any::urca
 
-      - name: Build clean financial 3-variable panel
-        run: Rscript --vanilla R/10_build_financial_3var_input.R
+      - name: Build clean baseline financial panel
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/10_build_financial_3var_input.R
 
-      - name: Validate financial weights
-        run: Rscript --vanilla R/20_weight_preflight.R
+      - name: Build Delta-r panel and static stability audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/15_variable_transformation_audit.R
 
-      - name: Reconfirm p1 q1 global stability
-        run: Rscript --vanilla R/30_stability_grid.R
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv || {
+            echo "::error::Delta-r panel was not created."
+            exit 1
+          }
 
-      - name: Reconfirm estimation gate
-        run: Rscript --vanilla R/40_estimation_gate.R
+          test -f results/variable_transform/09_same_sample_rate_spec_comparison.csv || {
+            echo "::error::Missing same-sample rate-specification comparison."
+            exit 1
+          }
 
-      - name: Run Bayesian TVP-GVAR smoke test
-        run: Rscript --vanilla R/50_tvp_gvar_smoke_test.R
+          test -f results/variable_transform/11_transformation_integrity_gate.csv || {
+            echo "::error::Missing transformation integrity gate."
+            exit 1
+          }
 
-      - name: Show smoke-test gate
+      - name: Enforce Delta-r pre-smoke gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            source("R/00_config.R")
+
+            transform_gate <- read.csv(
+              "results/variable_transform/11_transformation_integrity_gate.csv",
+              stringsAsFactors = FALSE,
+              check.names = FALSE
+            )
+
+            if (!("Pass" %in% names(transform_gate))) {
+              stop("Transformation integrity gate has no Pass column.")
+            }
+
+            pass <- as.logical(transform_gate$Pass)
+            if (any(is.na(pass)) || !all(pass)) {
+              print(transform_gate)
+              stop("Delta-r transformation integrity gate failed.")
+            }
+
+            # Verify the exact selected W rather than relying on a stale file name.
+            W <- read_weight_matrix(network_path(MAIN_NETWORK), normalize = TRUE)
+            if (max(abs(diag(W))) > 1e-8) {
+              stop("Selected W has a non-zero diagonal.")
+            }
+            if (max(abs(rowSums(W) - 1)) > 1e-8) {
+              stop("Selected W is not row-normalized.")
+            }
+
+            cmp <- read.csv(
+              "results/variable_transform/09_same_sample_rate_spec_comparison.csv",
+              stringsAsFactors = FALSE,
+              check.names = FALSE
+            )
+
+            required <- c(
+              "Network",
+              "GlobalSpectralRadius_RateLevel",
+              "GlobalSpectralRadius_RateDiff"
+            )
+            if (!all(required %in% names(cmp))) {
+              stop(
+                "Rate-specification comparison is missing: ",
+                paste(setdiff(required, names(cmp)), collapse = ", ")
+              )
+            }
+
+            z <- cmp[cmp$Network == MAIN_NETWORK, , drop = FALSE]
+            if (nrow(z) != 1L) {
+              stop("Expected exactly one row for selected network: ", MAIN_NETWORK)
+            }
+
+            rho_level <- as.numeric(z$GlobalSpectralRadius_RateLevel[1])
+            rho_diff  <- as.numeric(z$GlobalSpectralRadius_RateDiff[1])
+
+            if (!is.finite(rho_diff)) {
+              stop("Delta-r global spectral radius is non-finite.")
+            }
+            if (rho_diff >= 1) {
+              stop(sprintf(
+                "Delta-r static GVAR is unstable for %s: rho=%.8f",
+                MAIN_NETWORK, rho_diff
+              ))
+            }
+
+            dir.create("results/gate", recursive = TRUE, showWarnings = FALSE)
+
+            gate <- data.frame(
+              Status = "READY",
+              MainNetwork = MAIN_NETWORK,
+              NetworkRole = network_role(MAIN_NETWORK),
+              SourcePanel = "panel_domestic_fin3_rate_diff.csv",
+              InterestRateSpecification = "Delta_r",
+              RateLevelGlobalSpectralRadius = rho_level,
+              RateDiffGlobalSpectralRadius = rho_diff,
+              stringsAsFactors = FALSE
+            )
+
+            write.csv(
+              gate,
+              "results/gate/01_estimation_gate_rate_diff.csv",
+              row.names = FALSE
+            )
+
+            cat("DELTA-R PRE-SMOKE GATE: PASS\n")
+            cat("Network:", MAIN_NETWORK, "\n")
+            cat("Rate-level rho:", format(rho_level, digits = 10), "\n")
+            cat("Delta-r rho:", format(rho_diff, digits = 10), "\n")
+          '
+
+      - name: Build temporary Delta-r smoke runner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          src = Path("R/50_tvp_gvar_smoke_test.R")
+          dst = Path("R/50_tvp_gvar_smoke_test_rate_diff_runtime.R")
+
+          if not src.exists():
+              raise SystemExit("Missing R/50_tvp_gvar_smoke_test.R")
+
+          text = src.read_text(encoding="utf-8")
+
+          replacements = [
+              (
+                  'PANEL <- file.path(DERIVED_DIR, "panel_domestic_fin3.csv")',
+                  'PANEL <- file.path(DERIVED_DIR, "panel_domestic_fin3_rate_diff.csv")'
+              ),
+              (
+                  'PRE_GATE <- file.path(RESULTS_DIR, "gate", "01_estimation_gate.csv")',
+                  'PRE_GATE <- file.path(RESULTS_DIR, "gate", "01_estimation_gate_rate_diff.csv")'
+              ),
+              (
+                  'W <- read_weight_matrix(WEIGHT_FILES[[MAIN_NETWORK]])',
+                  'W <- read_weight_matrix(network_path(MAIN_NETWORK))'
+              ),
+          ]
+
+          for old, new in replacements:
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(
+                      f"Expected exactly one occurrence of patch target, found {n}: {old}"
+                  )
+              text = text.replace(old, new, 1)
+
+          # Make the runtime output self-identifying.
+          marker = 'sprintf("Main network: %s", MAIN_NETWORK),'
+          replacement = (
+              'sprintf("Main network: %s", MAIN_NETWORK),\n'
+              '  "Input panel: panel_domestic_fin3_rate_diff.csv",\n'
+              '  "Interest-rate specification: Delta r",'
+          )
+          if text.count(marker) != 1:
+              raise SystemExit(
+                  "Could not add Delta-r identity lines to the smoke-test README."
+              )
+          text = text.replace(marker, replacement, 1)
+
+          dst.write_text(text, encoding="utf-8")
+          print(f"Wrote {dst}")
+          PY
+
+          grep -n 'panel_domestic_fin3_rate_diff.csv' \
+            R/50_tvp_gvar_smoke_test_rate_diff_runtime.R
+
+          grep -n '01_estimation_gate_rate_diff.csv' \
+            R/50_tvp_gvar_smoke_test_rate_diff_runtime.R
+
+      - name: Write smoke-test specification manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/tvp_smoke
+
+          cat > results/tvp_smoke/00_rate_diff_smoke_specification.txt <<EOF
+          DiagnosticOnly=TRUE
+          FinalPublicationEstimator=FALSE
+          Network=${FIN3_NETWORK}
+          InputPanel=data/derived/panel_domestic_fin3_rate_diff.csv
+          InterestRateSpecification=Delta_r
+          REERSpecification=REER_DLOG_as_prepared
+          EquitySpecification=EQ_RETURN_as_prepared
+          P=1
+          Q=1
+          SmokeEstimator=legacy_random_walk_FFBS_architecture_test
+          FormalProductionEstimator=R/60_formal_bayesian_tvp_gvar.R
+          TradeProductionWorkflow=.github/workflows/10_trade_network_end_to_end.yml
+          EOF
+
+      - name: Run Delta-r Bayesian TVP-GVAR smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/50_tvp_gvar_smoke_test_rate_diff_runtime.R
+
+      - name: Show Delta-r smoke-test gate
         if: always()
         shell: bash
         run: |
-          echo "=== PRE-ESTIMATION GATE ==="
-          cat results/gate/ESTIMATION_GATE.txt || true
+          echo "=== DELTA-R PRE-SMOKE GATE ==="
+          cat results/gate/01_estimation_gate_rate_diff.csv || true
           echo
-          echo "=== TVP SMOKE TEST ==="
+
+          echo "=== DELTA-R TVP SMOKE TEST ==="
           cat results/tvp_smoke/README_tvp_smoke.txt || true
           echo
+
+          echo "=== SPECIFICATION MANIFEST ==="
+          cat results/tvp_smoke/00_rate_diff_smoke_specification.txt || true
+          echo
+
           echo "=== WORST QUARTERS BY POSTERIOR STABILITY ==="
           if [ -f results/tvp_smoke/01_posterior_stability_by_quarter.csv ]; then
-            Rscript --vanilla -e 'd<-read.csv("results/tvp_smoke/01_posterior_stability_by_quarter.csv"); d<-d[order(d$StableShare,-d$RhoP95),]; print(utils::head(d,15),row.names=FALSE)'
+            Rscript --vanilla -e '
+              d <- read.csv(
+                "results/tvp_smoke/01_posterior_stability_by_quarter.csv",
+                stringsAsFactors = FALSE
+              )
+              d <- d[order(d$StableShare, -d$RhoP95), ]
+              print(utils::head(d, 15), row.names = FALSE)
+            '
           fi
 
-      - name: Upload TVP smoke-test artifact
+      - name: Upload Delta-r smoke-test artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: financial-3var-tvp-smoke-${{ github.run_id }}
+          name: financial-3var-delta-r-tvp-smoke-${{ github.run_id }}
           path: |
-            data/derived/
-            results/weights/
-            results/stability/
-            results/gate/
+            data/derived/panel_domestic_fin3_rate_diff.csv
+            results/variable_transform/
+            results/gate/01_estimation_gate_rate_diff.csv
             results/tvp_smoke/
           if-no-files-found: warn
           retention-days: 30
