@@ -1,47 +1,48 @@
-name: Financial 3var Delta-r TVP-GVAR smoke test
+name: Financial 3var Delta-r formal preflight
 
 on:
   workflow_dispatch:
-    inputs:
-      draws:
-        description: "FFBS posterior draws for the Delta-r smoke test"
-        required: false
-        default: "60"
-      state_scale:
-        description: "Random-walk TVP innovation scale"
-        required: false
-        default: "0.00001"
-      min_stable_share:
-        description: "Minimum posterior draw-quarter share with global spectral radius < 1"
-        required: false
-        default: "0.90"
 
 permissions:
   contents: read
 
 jobs:
-  tvp-smoke-rate-diff:
+  delta_r_formal_preflight:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     env:
-      # This diagnostic is deliberately tied to the accepted financial baseline.
-      # The separate workflow 10 handles trade-W production estimation.
+      # This 03 workflow is a deterministic preflight for the accepted
+      # financial baseline. Trade-W production has its own workflow 10.
       FIN3_NETWORK: "main_restated_exdom_2017"
-
-      TVP_SMOKE_DRAWS: ${{ github.event.inputs.draws || '60' }}
-      TVP_STATE_SCALE: ${{ github.event.inputs.state_scale || '0.00001' }}
-      TVP_MIN_STABLE_SHARE: ${{ github.event.inputs.min_stable_share || '0.90' }}
-      TVP_SMOKE_SEED: "20260901"
-      TVP_PRIOR_SCALE: "4"
-      TVP_RIDGE: "0.00000001"
-      TVP_MIN_G0_RCOND: "0.0000000001"
-      TVP_MAX_SPLIT_DIFF: "0.10"
-      TVP_MAX_ABS_STD_BETA: "50"
 
     steps:
       - name: Checkout financial repository
         uses: actions/checkout@v4
+
+      - name: Verify required code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            "R/00_config.R"
+            "R/10_build_financial_3var_input.R"
+            "R/15_variable_transformation_audit.R"
+            "R/60_formal_bayesian_tvp_gvar.R"
+            "R/61_formal_mcmc_diagnostics.R"
+            "R/63_posterior_dynamic_stability_source_diagnostic.R"
+            "R/65_rate_diff_formal_decision.R"
+          )
+
+          for f in "${required[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing required file: $f"
+              exit 1
+            }
+          done
+
+          echo "FORMAL PREFLIGHT SOURCE CONTRACT: PASS"
 
       - name: Fetch validated macro inputs
         shell: bash
@@ -61,7 +62,7 @@ jobs:
 
           for f in "${required[@]}"; do
             test -f "$f" || {
-              echo "::error::Missing required source input: $f"
+              echo "::error::Missing validated input: $f"
               exit 1
             }
           done
@@ -72,260 +73,437 @@ jobs:
           r-version: "4.4.2"
           use-public-rspm: true
 
-      - name: Install dependencies
+      - name: Install deterministic preflight dependencies
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
           packages: |
             any::readxl
             any::urca
 
-      - name: Build clean baseline financial panel
+      - name: Build clean 3-variable panel
         shell: bash
         run: |
           set -euo pipefail
           Rscript --vanilla R/10_build_financial_3var_input.R
 
-      - name: Build Delta-r panel and static stability audit
+      - name: Build Delta-r panel and transformation audit
         shell: bash
         run: |
           set -euo pipefail
           Rscript --vanilla R/15_variable_transformation_audit.R
 
-          test -f data/derived/panel_domestic_fin3_rate_diff.csv || {
-            echo "::error::Delta-r panel was not created."
-            exit 1
+      - name: Run deterministic Delta-r formal preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          source("R/00_config.R")
+
+          OUT <- file.path(RESULTS_DIR, "formal_preflight")
+          dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
+
+          # ---------------------------------------------------------------
+          # 1. Input panel contract
+          # ---------------------------------------------------------------
+          panel_path <- file.path(
+            DERIVED_DIR,
+            "panel_domestic_fin3_rate_diff.csv"
+          )
+          if (!file.exists(panel_path)) {
+            stopf("Missing formal Delta-r panel: %s", panel_path)
           }
 
-          test -f results/variable_transform/09_same_sample_rate_spec_comparison.csv || {
-            echo "::error::Missing same-sample rate-specification comparison."
-            exit 1
+          d <- read.csv(
+            panel_path,
+            stringsAsFactors = FALSE,
+            check.names = FALSE
+          )
+
+          need <- c(
+            "Quarter", "Country",
+            "r", "de", "deq",
+            "gpr", "brent"
+          )
+
+          if (!all(need %in% names(d))) {
+            stopf(
+              "Formal Delta-r panel missing columns: %s",
+              paste(setdiff(need, names(d)), collapse = ", ")
+            )
           }
 
-          test -f results/variable_transform/11_transformation_integrity_gate.csv || {
-            echo "::error::Missing transformation integrity gate."
-            exit 1
+          d$Country <- toupper(trimws(as.character(d$Country)))
+          d$Quarter <- toupper(trimws(as.character(d$Quarter)))
+
+          if (!setequal(unique(d$Country), COUNTRIES)) {
+            stopf("Formal Delta-r panel does not contain exactly 14 economies.")
           }
 
-      - name: Enforce Delta-r pre-smoke gate
+          q <- unique(d$Quarter)
+          if (any(table(d$Country) != length(q))) {
+            stopf("Formal Delta-r panel is not balanced.")
+          }
+
+          for (nm in c("r","de","deq","gpr","brent")) {
+            d[[nm]] <- num(d[[nm]])
+          }
+
+          if (any(!is.finite(
+            as.matrix(d[, c("r","de","deq","gpr","brent")])
+          ))) {
+            stopf("Formal Delta-r panel contains non-finite values.")
+          }
+
+          # ---------------------------------------------------------------
+          # 2. Transformation integrity
+          # ---------------------------------------------------------------
+          trans_file <- file.path(
+            RESULTS_DIR,
+            "variable_transform",
+            "11_transformation_integrity_gate.csv"
+          )
+          if (!file.exists(trans_file)) {
+            stopf("Missing transformation integrity gate.")
+          }
+
+          tg <- read.csv(
+            trans_file,
+            stringsAsFactors = FALSE,
+            check.names = FALSE
+          )
+
+          if (!("Pass" %in% names(tg))) {
+            stopf("Transformation gate has no Pass column.")
+          }
+
+          pass <- as.logical(tg$Pass)
+          if (any(is.na(pass)) || !all(pass)) {
+            print(tg)
+            stopf("Transformation integrity gate failed.")
+          }
+
+          # ---------------------------------------------------------------
+          # 3. Weight-matrix integrity
+          # ---------------------------------------------------------------
+          wpath <- network_path(MAIN_NETWORK)
+          W <- read_weight_matrix(wpath, normalize = FALSE)
+
+          finite_w <- all(is.finite(W))
+          nonnegative_w <- all(W >= -1e-12)
+          zero_diag <- max(abs(diag(W))) <= 1e-8
+          row_norm <- max(abs(rowSums(W) - 1)) <= 1e-8
+
+          if (!finite_w) stopf("Selected W contains non-finite cells.")
+          if (!nonnegative_w) stopf("Selected W contains negative cells.")
+          if (!zero_diag) stopf("Selected W has non-zero diagonal.")
+          if (!row_norm) stopf("Selected W is not row-normalized.")
+
+          # ---------------------------------------------------------------
+          # 4. Same-sample static Delta-r stability
+          # ---------------------------------------------------------------
+          cmp_file <- file.path(
+            RESULTS_DIR,
+            "variable_transform",
+            "09_same_sample_rate_spec_comparison.csv"
+          )
+          if (!file.exists(cmp_file)) {
+            stopf("Missing rate-specification comparison.")
+          }
+
+          cmp <- read.csv(
+            cmp_file,
+            stringsAsFactors = FALSE,
+            check.names = FALSE
+          )
+
+          required_cmp <- c(
+            "Network",
+            "SampleStart",
+            "SampleEnd",
+            "T",
+            "GlobalSpectralRadius_RateLevel",
+            "Stable_RateLevel",
+            "G0_rcond_RateLevel",
+            "G0_kappa_RateLevel",
+            "MaxLocalDomesticRadius_RateLevel",
+            "GlobalSpectralRadius_RateDiff",
+            "Stable_RateDiff",
+            "G0_rcond_RateDiff",
+            "G0_kappa_RateDiff",
+            "MaxLocalDomesticRadius_RateDiff",
+            "UnstableLocalCount_RateDiff"
+          )
+
+          if (!all(required_cmp %in% names(cmp))) {
+            stopf(
+              "Rate-specification comparison missing columns: %s",
+              paste(
+                setdiff(required_cmp, names(cmp)),
+                collapse = ", "
+              )
+            )
+          }
+
+          z <- cmp[
+            trimws(as.character(cmp$Network)) == MAIN_NETWORK,
+            ,
+            drop = FALSE
+          ]
+
+          if (nrow(z) != 1L) {
+            stopf(
+              "Expected exactly one stability row for %s; found %d.",
+              MAIN_NETWORK,
+              nrow(z)
+            )
+          }
+
+          rho_level <- as.numeric(
+            z$GlobalSpectralRadius_RateLevel[1]
+          )
+          rho_diff <- as.numeric(
+            z$GlobalSpectralRadius_RateDiff[1]
+          )
+          g0_rc_diff <- as.numeric(
+            z$G0_rcond_RateDiff[1]
+          )
+          g0_kappa_diff <- as.numeric(
+            z$G0_kappa_RateDiff[1]
+          )
+          max_local_diff <- as.numeric(
+            z$MaxLocalDomesticRadius_RateDiff[1]
+          )
+          unstable_local_diff <- as.integer(
+            z$UnstableLocalCount_RateDiff[1]
+          )
+
+          if (!is.finite(rho_diff)) {
+            stopf("Delta-r global spectral radius is non-finite.")
+          }
+
+          if (!(rho_diff < 1)) {
+            stopf(
+              "Delta-r static GVAR is unstable: rho=%.10f",
+              rho_diff
+            )
+          }
+
+          if (!is.finite(g0_rc_diff) || g0_rc_diff <= 0) {
+            stopf("Delta-r static G0 is non-invertible.")
+          }
+
+          if (!is.finite(max_local_diff) || max_local_diff >= 1) {
+            stopf(
+              "At least one Delta-r local domestic block is unstable."
+            )
+          }
+
+          if (is.na(unstable_local_diff) ||
+              unstable_local_diff != 0L) {
+            stopf(
+              "Delta-r local unstable count is not zero: %s",
+              unstable_local_diff
+            )
+          }
+
+          # ---------------------------------------------------------------
+          # 5. Formal interpretation:
+          #    This workflow does NOT use legacy R/50 FFBS as a hard gate.
+          # ---------------------------------------------------------------
+          gate <- data.frame(
+            Status = "READY_FOR_FORMAL_BAYESIAN_ESTIMATION",
+            MainNetwork = MAIN_NETWORK,
+            NetworkRole = network_role(MAIN_NETWORK),
+            WeightFile = wpath,
+            FormalPanel = basename(panel_path),
+            InterestRateSpecification = "Delta_r",
+            REERSpecification = "REER_DLOG_as_prepared",
+            EquitySpecification = "EQ_RETURN_as_prepared",
+            SampleStart = as.character(z$SampleStart[1]),
+            SampleEnd = as.character(z$SampleEnd[1]),
+            SameSampleT = as.integer(z$T[1]),
+            RateLevelGlobalSpectralRadius = rho_level,
+            RateDiffGlobalSpectralRadius = rho_diff,
+            RateDiffG0_rcond = g0_rc_diff,
+            RateDiffG0_kappa = g0_kappa_diff,
+            RateDiffMaxLocalDomesticRadius = max_local_diff,
+            RateDiffUnstableLocalCount = unstable_local_diff,
+            TransformationIntegrityPass = TRUE,
+            WeightFinite = finite_w,
+            WeightNonnegative = nonnegative_w,
+            WeightZeroDiagonal = zero_diag,
+            WeightRowNormalized = row_norm,
+            LegacyR50SmokeUsedAsHardGate = FALSE,
+            PosteriorConvergenceGate = "R/61_formal_mcmc_diagnostics.R",
+            PosteriorDynamicStabilityGate =
+              "R/63_posterior_dynamic_stability_source_diagnostic.R",
+            FormalRateDiffDecisionGate =
+              "R/65_rate_diff_formal_decision.R",
+            stringsAsFactors = FALSE
+          )
+
+          write.csv(
+            gate,
+            file.path(OUT, "00_formal_preflight_gate.csv"),
+            row.names = FALSE
+          )
+
+          claims <- data.frame(
+            Claim = c(
+              "Delta-r panel is the formal estimation input",
+              "Selected W is structurally valid",
+              "Static Delta-r global GVAR is stable",
+              "All local domestic Delta-r blocks are stable",
+              "Legacy R50 random-walk FFBS smoke is required to exceed 90 percent stability",
+              "Formal posterior stability is decided before R60 estimation",
+              "Formal posterior convergence is checked by R61 after R60",
+              "Formal posterior dynamic stability is checked by R63 after R60"
+            ),
+            Supported = c(
+              TRUE, TRUE, TRUE, TRUE,
+              FALSE, FALSE, TRUE, TRUE
+            ),
+            Evidence = c(
+              basename(panel_path),
+              sprintf(
+                "finite=%s; nonnegative=%s; diag0=%s; rowsum1=%s",
+                finite_w, nonnegative_w, zero_diag, row_norm
+              ),
+              sprintf("static Delta-r rho=%.10f", rho_diff),
+              sprintf(
+                "max local rho=%.10f; unstable count=%d",
+                max_local_diff, unstable_local_diff
+              ),
+              "R50 is a legacy conditional-hyperparameter architecture diagnostic, not the formal estimator.",
+              "Posterior stability cannot be known before drawing the formal R60 posterior.",
+              "R61 is the formal four-chain Rhat/ESS gate.",
+              "R63 reconstructs formal posterior global dynamic stability."
+            ),
+            stringsAsFactors = FALSE
+          )
+
+          write.csv(
+            claims,
+            file.path(OUT, "01_claims_guardrail.csv"),
+            row.names = FALSE
+          )
+
+          lines <- c(
+            "DELTA-R FORMAL PREFLIGHT: READY_FOR_FORMAL_BAYESIAN_ESTIMATION",
+            "================================================================",
+            sprintf("Network: %s", MAIN_NETWORK),
+            sprintf("Network role: %s", network_role(MAIN_NETWORK)),
+            sprintf(
+              "Formal panel: %s",
+              basename(panel_path)
+            ),
+            sprintf(
+              "Same-sample window: %s - %s; T=%d",
+              z$SampleStart[1],
+              z$SampleEnd[1],
+              as.integer(z$T[1])
+            ),
+            sprintf(
+              "Rate-level static rho: %.10f",
+              rho_level
+            ),
+            sprintf(
+              "Delta-r static rho: %.10f",
+              rho_diff
+            ),
+            sprintf(
+              "Delta-r G0 rcond: %.10g",
+              g0_rc_diff
+            ),
+            sprintf(
+              "Delta-r G0 kappa: %.10f",
+              g0_kappa_diff
+            ),
+            sprintf(
+              "Delta-r max local domestic rho: %.10f",
+              max_local_diff
+            ),
+            sprintf(
+              "Delta-r unstable local blocks: %d",
+              unstable_local_diff
+            ),
+            "",
+            "Decision:",
+            "- Deterministic preflight passed.",
+            "- Do NOT use legacy R/50 FFBS stable-share as a production gate.",
+            "- Formal Bayesian estimation is R/60.",
+            "- Formal convergence is R/61.",
+            "- Formal posterior dynamic stability is R/63.",
+            "- Final Delta-r specification decision is R/65.",
+            "",
+            "This preflight does not claim that the formal posterior will pass;",
+            "that question is answered only after R/60 estimation."
+          )
+
+          writeLines(
+            lines,
+            file.path(OUT, "README_formal_preflight.txt")
+          )
+
+          cat(paste(lines, collapse = "\n"), "\n")
+          RS
+
+      - name: Enforce formal preflight gate
         shell: bash
         run: |
           set -euo pipefail
 
           Rscript --vanilla -e '
-            source("R/00_config.R")
+            f <- "results/formal_preflight/00_formal_preflight_gate.csv"
 
-            transform_gate <- read.csv(
-              "results/variable_transform/11_transformation_integrity_gate.csv",
+            if (!file.exists(f)) {
+              stop("Missing formal preflight gate.")
+            }
+
+            g <- read.csv(
+              f,
               stringsAsFactors = FALSE,
               check.names = FALSE
             )
 
-            if (!("Pass" %in% names(transform_gate))) {
-              stop("Transformation integrity gate has no Pass column.")
+            if (nrow(g) != 1L ||
+                g$Status[1] != "READY_FOR_FORMAL_BAYESIAN_ESTIMATION") {
+              print(g)
+              stop("Formal Delta-r preflight did not pass.")
             }
 
-            pass <- as.logical(transform_gate$Pass)
-            if (any(is.na(pass)) || !all(pass)) {
-              print(transform_gate)
-              stop("Delta-r transformation integrity gate failed.")
+            if (isTRUE(g$LegacyR50SmokeUsedAsHardGate[1])) {
+              stop("Legacy R50 must not be a hard production gate.")
             }
 
-            # Verify the exact selected W rather than relying on a stale file name.
-            W <- read_weight_matrix(network_path(MAIN_NETWORK), normalize = TRUE)
-            if (max(abs(diag(W))) > 1e-8) {
-              stop("Selected W has a non-zero diagonal.")
-            }
-            if (max(abs(rowSums(W) - 1)) > 1e-8) {
-              stop("Selected W is not row-normalized.")
-            }
-
-            cmp <- read.csv(
-              "results/variable_transform/09_same_sample_rate_spec_comparison.csv",
-              stringsAsFactors = FALSE,
-              check.names = FALSE
-            )
-
-            required <- c(
-              "Network",
-              "GlobalSpectralRadius_RateLevel",
-              "GlobalSpectralRadius_RateDiff"
-            )
-            if (!all(required %in% names(cmp))) {
-              stop(
-                "Rate-specification comparison is missing: ",
-                paste(setdiff(required, names(cmp)), collapse = ", ")
-              )
-            }
-
-            z <- cmp[cmp$Network == MAIN_NETWORK, , drop = FALSE]
-            if (nrow(z) != 1L) {
-              stop("Expected exactly one row for selected network: ", MAIN_NETWORK)
-            }
-
-            rho_level <- as.numeric(z$GlobalSpectralRadius_RateLevel[1])
-            rho_diff  <- as.numeric(z$GlobalSpectralRadius_RateDiff[1])
-
-            if (!is.finite(rho_diff)) {
-              stop("Delta-r global spectral radius is non-finite.")
-            }
-            if (rho_diff >= 1) {
-              stop(sprintf(
-                "Delta-r static GVAR is unstable for %s: rho=%.8f",
-                MAIN_NETWORK, rho_diff
-              ))
-            }
-
-            dir.create("results/gate", recursive = TRUE, showWarnings = FALSE)
-
-            gate <- data.frame(
-              Status = "READY",
-              MainNetwork = MAIN_NETWORK,
-              NetworkRole = network_role(MAIN_NETWORK),
-              SourcePanel = "panel_domestic_fin3_rate_diff.csv",
-              InterestRateSpecification = "Delta_r",
-              RateLevelGlobalSpectralRadius = rho_level,
-              RateDiffGlobalSpectralRadius = rho_diff,
-              stringsAsFactors = FALSE
-            )
-
-            write.csv(
-              gate,
-              "results/gate/01_estimation_gate_rate_diff.csv",
-              row.names = FALSE
-            )
-
-            cat("DELTA-R PRE-SMOKE GATE: PASS\n")
-            cat("Network:", MAIN_NETWORK, "\n")
-            cat("Rate-level rho:", format(rho_level, digits = 10), "\n")
-            cat("Delta-r rho:", format(rho_diff, digits = 10), "\n")
+            cat("FORMAL DELTA-R PREFLIGHT: PASS\n")
+            print(g)
           '
 
-      - name: Build temporary Delta-r smoke runner
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          src = Path("R/50_tvp_gvar_smoke_test.R")
-          dst = Path("R/50_tvp_gvar_smoke_test_rate_diff_runtime.R")
-
-          if not src.exists():
-              raise SystemExit("Missing R/50_tvp_gvar_smoke_test.R")
-
-          text = src.read_text(encoding="utf-8")
-
-          replacements = [
-              (
-                  'PANEL <- file.path(DERIVED_DIR, "panel_domestic_fin3.csv")',
-                  'PANEL <- file.path(DERIVED_DIR, "panel_domestic_fin3_rate_diff.csv")'
-              ),
-              (
-                  'PRE_GATE <- file.path(RESULTS_DIR, "gate", "01_estimation_gate.csv")',
-                  'PRE_GATE <- file.path(RESULTS_DIR, "gate", "01_estimation_gate_rate_diff.csv")'
-              ),
-              (
-                  'W <- read_weight_matrix(WEIGHT_FILES[[MAIN_NETWORK]])',
-                  'W <- read_weight_matrix(network_path(MAIN_NETWORK))'
-              ),
-          ]
-
-          for old, new in replacements:
-              n = text.count(old)
-              if n != 1:
-                  raise SystemExit(
-                      f"Expected exactly one occurrence of patch target, found {n}: {old}"
-                  )
-              text = text.replace(old, new, 1)
-
-          # Make the runtime output self-identifying.
-          marker = 'sprintf("Main network: %s", MAIN_NETWORK),'
-          replacement = (
-              'sprintf("Main network: %s", MAIN_NETWORK),\n'
-              '  "Input panel: panel_domestic_fin3_rate_diff.csv",\n'
-              '  "Interest-rate specification: Delta r",'
-          )
-          if text.count(marker) != 1:
-              raise SystemExit(
-                  "Could not add Delta-r identity lines to the smoke-test README."
-              )
-          text = text.replace(marker, replacement, 1)
-
-          dst.write_text(text, encoding="utf-8")
-          print(f"Wrote {dst}")
-          PY
-
-          grep -n 'panel_domestic_fin3_rate_diff.csv' \
-            R/50_tvp_gvar_smoke_test_rate_diff_runtime.R
-
-          grep -n '01_estimation_gate_rate_diff.csv' \
-            R/50_tvp_gvar_smoke_test_rate_diff_runtime.R
-
-      - name: Write smoke-test specification manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p results/tvp_smoke
-
-          cat > results/tvp_smoke/00_rate_diff_smoke_specification.txt <<EOF
-          DiagnosticOnly=TRUE
-          FinalPublicationEstimator=FALSE
-          Network=${FIN3_NETWORK}
-          InputPanel=data/derived/panel_domestic_fin3_rate_diff.csv
-          InterestRateSpecification=Delta_r
-          REERSpecification=REER_DLOG_as_prepared
-          EquitySpecification=EQ_RETURN_as_prepared
-          P=1
-          Q=1
-          SmokeEstimator=legacy_random_walk_FFBS_architecture_test
-          FormalProductionEstimator=R/60_formal_bayesian_tvp_gvar.R
-          TradeProductionWorkflow=.github/workflows/10_trade_network_end_to_end.yml
-          EOF
-
-      - name: Run Delta-r Bayesian TVP-GVAR smoke test
-        shell: bash
-        run: |
-          set -euo pipefail
-          Rscript --vanilla R/50_tvp_gvar_smoke_test_rate_diff_runtime.R
-
-      - name: Show Delta-r smoke-test gate
+      - name: Show formal preflight
         if: always()
         shell: bash
         run: |
-          echo "=== DELTA-R PRE-SMOKE GATE ==="
-          cat results/gate/01_estimation_gate_rate_diff.csv || true
+          echo "=== FORMAL PREFLIGHT GATE ==="
+          cat results/formal_preflight/00_formal_preflight_gate.csv || true
           echo
 
-          echo "=== DELTA-R TVP SMOKE TEST ==="
-          cat results/tvp_smoke/README_tvp_smoke.txt || true
+          echo "=== PREFLIGHT README ==="
+          cat results/formal_preflight/README_formal_preflight.txt || true
           echo
 
-          echo "=== SPECIFICATION MANIFEST ==="
-          cat results/tvp_smoke/00_rate_diff_smoke_specification.txt || true
-          echo
+          echo "=== CLAIMS GUARDRAIL ==="
+          cat results/formal_preflight/01_claims_guardrail.csv || true
 
-          echo "=== WORST QUARTERS BY POSTERIOR STABILITY ==="
-          if [ -f results/tvp_smoke/01_posterior_stability_by_quarter.csv ]; then
-            Rscript --vanilla -e '
-              d <- read.csv(
-                "results/tvp_smoke/01_posterior_stability_by_quarter.csv",
-                stringsAsFactors = FALSE
-              )
-              d <- d[order(d$StableShare, -d$RhoP95), ]
-              print(utils::head(d, 15), row.names = FALSE)
-            '
-          fi
-
-      - name: Upload Delta-r smoke-test artifact
+      - name: Upload formal preflight artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: financial-3var-delta-r-tvp-smoke-${{ github.run_id }}
+          name: financial-3var-delta-r-formal-preflight-${{ github.run_id }}
           path: |
             data/derived/panel_domestic_fin3_rate_diff.csv
             results/variable_transform/
-            results/gate/01_estimation_gate_rate_diff.csv
-            results/tvp_smoke/
+            results/formal_preflight/
           if-no-files-found: warn
           retention-days: 30
