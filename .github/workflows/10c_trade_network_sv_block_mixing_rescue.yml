@@ -1,0 +1,1276 @@
+name: Financial 3var 10c Trade-W SV-block mixing rescue
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Original Trade-W run"
+        required: true
+        default: "34056102906"
+        type: string
+
+      rescue_10a_run_id:
+        description: "10a targeted rescue run"
+        required: true
+        default: "34058647894"
+        type: string
+
+      rescue_10b_run_id:
+        description: "10b final targeted rescue run"
+        required: true
+        default: "34063743751"
+        type: string
+
+      model_ref:
+        description: "Exact statistical-model code SHA"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+
+      rescue_burn_per_chain:
+        description: "Outer MCMC burn-in for CN/SG"
+        required: true
+        default: "12500"
+        type: string
+
+      rescue_postburn_per_chain:
+        description: "Outer internal post-burn iterations for CN/SG"
+        required: true
+        default: "50000"
+        type: string
+
+      stored_per_chain:
+        description: "Strictly post-burn stored draws"
+        required: true
+        default: "2000"
+        type: string
+
+      sv_inner_burnin:
+        description: "Extra stochvol transitions inside each outer MCMC iteration"
+        required: true
+        default: "4"
+        type: string
+
+      seed_base:
+        description: "Fresh independent seed base for 10c"
+        required: true
+        default: "20262431"
+        type: string
+
+      max_parallel:
+        description: "Maximum simultaneous rescue jobs"
+        required: true
+        default: "8"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify_sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+      RESCUE_10A_RUN_ID: ${{ inputs.rescue_10a_run_id }}
+      RESCUE_10B_RUN_ID: ${{ inputs.rescue_10b_run_id }}
+      MODEL_REF: ${{ inputs.model_ref }}
+
+    steps:
+      - name: Checkout exact model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Verify exact statistical-model SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "${MODEL_REF}" || {
+            echo "::error::Checked-out model SHA does not equal model_ref."
+            exit 1
+          }
+
+          for f in \
+            R/00_config.R \
+            R/60_formal_bayesian_tvp_gvar.R \
+            R/61_formal_mcmc_diagnostics.R
+          do
+            test -f "${f}" || {
+              echo "::error::Missing ${f}"
+              exit 1
+            }
+          done
+
+      - name: Verify all source workflow runs and artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          verify_run () {
+            local rid="$1"
+            local expected_path="$2"
+
+            local js
+            js="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}")"
+
+            test "$(jq -r '.status' <<<"${js}")" = "completed" || {
+              echo "::error::Run ${rid} is not completed."
+              exit 1
+            }
+
+            test "$(jq -r '.path' <<<"${js}")" = "${expected_path}" || {
+              echo "::error::Unexpected workflow path for run ${rid}."
+              echo "found=$(jq -r '.path' <<<"${js}")"
+              echo "expected=${expected_path}"
+              exit 1
+            }
+          }
+
+          verify_run \
+            "${ORIGINAL_RUN_ID}" \
+            ".github/workflows/10_trade_network_end_to_end.yml"
+
+          verify_run \
+            "${RESCUE_10A_RUN_ID}" \
+            ".github/workflows/10a_trade_network_targeted_convergence_rescue.yml"
+
+          verify_run \
+            "${RESCUE_10B_RUN_ID}" \
+            ".github/workflows/10b_trade_network_final_targeted_mcmc_rescue.yml"
+
+          original_json="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGINAL_RUN_ID}/artifacts?per_page=100"
+          )"
+
+          a10_json="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${RESCUE_10A_RUN_ID}/artifacts?per_page=100"
+          )"
+
+          b10_json="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${RESCUE_10B_RUN_ID}/artifacts?per_page=100"
+          )"
+
+          original_parts="$(
+            jq -r \
+              --arg rid "${ORIGINAL_RUN_ID}" \
+              '[.artifacts[]
+                | select(
+                    .expired == false
+                    and (.name | startswith("financial-3var-10-trade-part-trade_2000_2012-"))
+                    and (.name | endswith("-" + $rid))
+                  )
+               ] | length' \
+              <<<"${original_json}"
+          )"
+
+          a10_parts="$(
+            jq -r \
+              --arg rid "${RESCUE_10A_RUN_ID}" \
+              '[.artifacts[]
+                | select(
+                    .expired == false
+                    and (.name | startswith("financial-3var-10a-trade-rescue-trade_2000_2012-"))
+                    and (.name | endswith("-" + $rid))
+                  )
+               ] | length' \
+              <<<"${a10_json}"
+          )"
+
+          b10_parts="$(
+            jq -r \
+              --arg rid "${RESCUE_10B_RUN_ID}" \
+              '[.artifacts[]
+                | select(
+                    .expired == false
+                    and (.name | startswith("financial-3var-10b-trade-rescue-trade_2000_2012-"))
+                    and (.name | endswith("-" + $rid))
+                  )
+               ] | length' \
+              <<<"${b10_json}"
+          )"
+
+          b10_conv_name="financial-3var-10b-trade-convergence-trade_2000_2012-${RESCUE_10B_RUN_ID}"
+
+          b10_conv="$(
+            jq -r \
+              --arg name "${b10_conv_name}" \
+              '[.artifacts[]
+                | select(.expired == false and .name == $name)
+               ] | length' \
+              <<<"${b10_json}"
+          )"
+
+          echo "original parts=${original_parts}"
+          echo "10a parts=${a10_parts}"
+          echo "10b parts=${b10_parts}"
+          echo "10b convergence artifacts=${b10_conv}"
+
+          test "${original_parts}" = "56" || {
+            echo "::error::Expected 56 original posterior parts."
+            exit 1
+          }
+
+          test "${a10_parts}" = "36" || {
+            echo "::error::Expected 36 10a posterior parts."
+            exit 1
+          }
+
+          test "${b10_parts}" = "12" || {
+            echo "::error::Expected 12 10b posterior parts."
+            exit 1
+          }
+
+          test "${b10_conv}" = "1" || {
+            echo "::error::Expected one 10b convergence artifact."
+            exit 1
+          }
+
+          echo "10C SOURCE INTEGRITY: PASS"
+
+  rescue:
+    needs: verify_sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        country: [CN, SG]
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+
+      FIN3_BURN: ${{ inputs.rescue_burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.rescue_postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+
+    steps:
+      - name: Checkout exact model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Download exact original Trade-W input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify rescue contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv || {
+            echo "::error::Delta-r panel missing."
+            exit 1
+          }
+
+          test -f data/weights/W_trade_2000_2012.csv || {
+            echo "::error::Trade-W matrix missing."
+            exit 1
+          }
+
+          test -f results/events/00_event_calendar.csv || {
+            echo "::error::Event calendar missing."
+            exit 1
+          }
+
+          case "${FIN3_COUNTRY}" in
+            CN|SG) ;;
+            *)
+              echo "::error::Unexpected 10c rescue country ${FIN3_COUNTRY}"
+              exit 1
+              ;;
+          esac
+
+          test "${FIN3_NETWORK}" = "trade_2000_2012"
+          test "${FIN3_STORED_PER_CHAIN}" = "2000"
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4"
+
+          python3 - <<'PY'
+          import os
+
+          x = int(os.environ["FIN3_SV_INNER_BURNIN"])
+          if x < 1 or x > 20:
+              raise SystemExit(
+                  "FIN3_SV_INNER_BURNIN must be between 1 and 20."
+              )
+          PY
+
+          echo "=============================================="
+          echo "10C SV-BLOCK MIXING RESCUE"
+          echo "country=${FIN3_COUNTRY}"
+          echo "chain=${FIN3_CHAIN_ID}"
+          echo "outer burn=${FIN3_BURN}"
+          echo "outer post-burn=${FIN3_KEEP}"
+          echo "stored draws=${FIN3_STORED_PER_CHAIN}"
+          echo "SV inner burnin=${FIN3_SV_INNER_BURNIN}"
+          echo "seed base=${FIN3_SEED_BASE}"
+          echo "=============================================="
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp with stronger within-block SV mixing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+
+          rm -rf threshtvp_src
+          git clone \
+            https://github.com/gregorkastner/threshtvp.git \
+            threshtvp_src
+
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          test "$(git -C threshtvp_src rev-parse HEAD)" = "${THRESHTVP_SHA}"
+
+          find threshtvp_src/src \
+            -maxdepth 1 \
+            -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          p = Path("threshtvp_src/R/MCMC_function.R")
+          s = p.read_text(encoding="utf-8")
+
+          old = "draws=1, burnin=0"
+          inner = int(os.environ["FIN3_SV_INNER_BURNIN"])
+          new = f"draws=1, burnin={inner}"
+
+          n = s.count(old)
+          if n != 1:
+              raise SystemExit(
+                  f"Expected exactly one '{old}' occurrence; found {n}."
+              )
+
+          p.write_text(
+              s.replace(old, new, 1),
+              encoding="utf-8"
+          )
+
+          out = p.read_text(encoding="utf-8")
+          if new not in out:
+              raise SystemExit("SV inner-transition patch was not applied.")
+
+          print(
+              "Applied sampler-only patch:",
+              old,
+              "->",
+              new
+          )
+          PY
+
+          grep -n \
+            "svsample_fast_cpp(y=u_, draws=1, burnin=" \
+            threshtvp_src/R/MCMC_function.R
+
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+          Rscript --vanilla - <<'RS'
+          stopifnot(
+            requireNamespace(
+              "threshtvp",
+              quietly=TRUE
+            )
+          )
+          cat("Pinned threshtvp installed.\n")
+          RS
+
+      - name: Record sampler-transition audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            "results/formal_tvp_parts/${FIN3_COUNTRY}/chain_${FIN3_CHAIN_ID}"
+
+          cat > \
+            "results/formal_tvp_parts/${FIN3_COUNTRY}/chain_${FIN3_CHAIN_ID}/00_sampler_transition_audit.csv" <<EOF
+          Country,Chain,StatisticalModelSHA,ThreshtvpSHA,SVInnerBurnin,StatisticalModelChanged,PriorChanged,GateChanged
+          ${FIN3_COUNTRY},${FIN3_CHAIN_ID},${{ inputs.model_ref }},c0133f262fcf0f935805168f8b7def02b43dc6d5,${FIN3_SV_INNER_BURNIN},FALSE,FALSE,FALSE
+          EOF
+
+      - name: Run stronger-mixing Trade-W MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e '
+            source("R/00_config.R")
+
+            if (MAIN_NETWORK != "trade_2000_2012") {
+              stop("Unexpected network: ", MAIN_NETWORK)
+            }
+
+            if (!file.exists(network_path(MAIN_NETWORK))) {
+              stop("Selected trade W missing.")
+            }
+
+            cat("MAIN_NETWORK=", MAIN_NETWORK, "\n")
+          '
+
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Validate posterior metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          cc <- Sys.getenv("FIN3_COUNTRY")
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+
+          expected_burn <- as.integer(
+            Sys.getenv("FIN3_BURN")
+          )
+
+          expected_keep <- as.integer(
+            Sys.getenv("FIN3_KEEP")
+          )
+
+          expected_stored <- as.integer(
+            Sys.getenv("FIN3_STORED_PER_CHAIN")
+          )
+
+          f <- list.files(
+            file.path(
+              "results",
+              "formal_tvp_parts",
+              cc,
+              paste0("chain_", ch)
+            ),
+            pattern=paste0(
+              "^formal_tvp_",
+              cc,
+              "_chain",
+              ch,
+              "[.]rds$"
+            ),
+            full.names=TRUE
+          )
+
+          if (length(f) != 1L) {
+            stop(
+              "Expected exactly one posterior RDS; found ",
+              length(f)
+            )
+          }
+
+          z <- readRDS(f)
+
+          stopifnot(
+            as.character(z$meta$country) == cc
+          )
+
+          stopifnot(
+            as.integer(z$meta$chain) == ch
+          )
+
+          stopifnot(
+            as.integer(z$meta$burn) == expected_burn
+          )
+
+          stopifnot(
+            as.integer(z$meta$keep_internal) == expected_keep
+          )
+
+          stopifnot(
+            as.integer(z$meta$stored_draws) == expected_stored
+          )
+
+          stopifnot(
+            basename(
+              as.character(z$meta$source_panel)
+            ) ==
+              "panel_domestic_fin3_rate_diff.csv"
+          )
+
+          stopifnot(
+            as.character(z$meta$main_network) ==
+              "trade_2000_2012"
+          )
+
+          cat("10C POSTERIOR METADATA: PASS\n")
+          RS
+
+      - name: Build per-chain degeneracy audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          cc <- Sys.getenv("FIN3_COUNTRY")
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+
+          root <- file.path(
+            "results",
+            "formal_tvp_parts",
+            cc,
+            paste0("chain_", ch)
+          )
+
+          f <- file.path(
+            root,
+            "02_chain_monitor_summary.csv"
+          )
+
+          if (!file.exists(f)) {
+            stop(
+              "Missing chain monitor summary: ",
+              f
+            )
+          }
+
+          x <- read.csv(
+            f,
+            stringsAsFactors=FALSE,
+            check.names=FALSE
+          )
+
+          need <- c(
+            "Parameter",
+            "Mean",
+            "SD"
+          )
+
+          if (!all(need %in% names(x))) {
+            stop(
+              "Unexpected chain-monitor schema."
+            )
+          }
+
+          v0 <- grepl(
+            "__V0__",
+            x$Parameter,
+            fixed=TRUE
+          )
+
+          degenerate <- (
+            v0 &
+            is.finite(x$Mean) &
+            is.finite(x$SD) &
+            abs(x$Mean) < 1e-12 &
+            x$SD < 1e-14
+          )
+
+          audit <- data.frame(
+            Country=cc,
+            Chain=ch,
+            MonitoredParameters=nrow(x),
+            DegenerateV0Parameters=sum(degenerate),
+            Status=ifelse(
+              any(degenerate),
+              "WARNING_DEGENERATE_V0",
+              "PASS"
+            ),
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(
+            audit,
+            file.path(
+              root,
+              "05_chain_degeneracy_audit.csv"
+            ),
+            row.names=FALSE
+          )
+
+          if (any(degenerate)) {
+            write.csv(
+              x[degenerate,,drop=FALSE],
+              file.path(
+                root,
+                "06_degenerate_parameters.csv"
+              ),
+              row.names=FALSE
+            )
+
+            cat(
+              "::warning::Machine-zero V0 collapse detected.\n"
+            )
+          } else {
+            cat(
+              "10C CHAIN DEGENERACY AUDIT: PASS\n"
+            )
+          }
+          RS
+
+      - name: Upload 10c rescue posterior
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10c-trade-sv-rescue-trade_2000_2012-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  diagnose:
+    needs: [verify_sources, rescue]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+      RESCUE_10A_RUN_ID: ${{ inputs.rescue_10a_run_id }}
+      RESCUE_10B_RUN_ID: ${{ inputs.rescue_10b_run_id }}
+
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_PARTS_ROOT: "posterior_parts"
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+
+      RESCUE_10C_BURN: ${{ inputs.rescue_burn_per_chain }}
+      RESCUE_10C_KEEP: ${{ inputs.rescue_postburn_per_chain }}
+
+    steps:
+      - name: Checkout exact model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Download all original posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10-trade-part-trade_2000_2012-*-${{ inputs.original_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Remove countries superseded by 10a
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          countries=(BR CH CN UK KR NO SG TR ZA)
+
+          for cc in "${countries[@]}"; do
+            dirs=(
+              posterior_parts/financial-3var-10-trade-part-trade_2000_2012-${cc}-chain*-${ORIGINAL_RUN_ID}
+            )
+
+            test "${#dirs[@]}" -eq 4 || {
+              echo "::error::Expected 4 original dirs for ${cc}; found ${#dirs[@]}"
+              exit 1
+            }
+
+            rm -rf "${dirs[@]}"
+          done
+
+      - name: Download all 10a rescue posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10a-trade-rescue-trade_2000_2012-*-${{ inputs.rescue_10a_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.rescue_10a_run_id }}
+
+      - name: Remove CN NO SG 10a parts superseded by 10b
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          countries=(CN NO SG)
+
+          for cc in "${countries[@]}"; do
+            dirs=(
+              posterior_parts/financial-3var-10a-trade-rescue-trade_2000_2012-${cc}-chain*-${RESCUE_10A_RUN_ID}
+            )
+
+            test "${#dirs[@]}" -eq 4 || {
+              echo "::error::Expected 4 10a dirs for ${cc}; found ${#dirs[@]}"
+              exit 1
+            }
+
+            rm -rf "${dirs[@]}"
+          done
+
+      - name: Download all 10b rescue posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10b-trade-rescue-trade_2000_2012-*-${{ inputs.rescue_10b_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.rescue_10b_run_id }}
+
+      - name: Remove CN SG 10b parts superseded by 10c
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          countries=(CN SG)
+
+          for cc in "${countries[@]}"; do
+            dirs=(
+              posterior_parts/financial-3var-10b-trade-rescue-trade_2000_2012-${cc}-chain*-${RESCUE_10B_RUN_ID}
+            )
+
+            test "${#dirs[@]}" -eq 4 || {
+              echo "::error::Expected 4 10b dirs for ${cc}; found ${#dirs[@]}"
+              exit 1
+            }
+
+            rm -rf "${dirs[@]}"
+          done
+
+      - name: Download 8 new 10c posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10c-trade-sv-rescue-trade_2000_2012-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Verify exact final 56-chain posterior grid
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          source("R/00_config.R")
+
+          original_countries <- c(
+            "AU","CA","EA","JP","US"
+          )
+
+          stage1_countries <- c(
+            "BR","CH","UK","KR","TR","ZA"
+          )
+
+          stage2_country <- "NO"
+
+          stage3_countries <- c(
+            "CN","SG"
+          )
+
+          burn10c <- as.integer(
+            Sys.getenv("RESCUE_10C_BURN")
+          )
+
+          keep10c <- as.integer(
+            Sys.getenv("RESCUE_10C_KEEP")
+          )
+
+          stored_expected <- as.integer(
+            Sys.getenv("FIN3_STORED_PER_CHAIN")
+          )
+
+          fs <- list.files(
+            "posterior_parts",
+            pattern="^formal_tvp_[A-Z]{2}_chain[0-9]+[.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+
+          cat(
+            "Posterior RDS count=",
+            length(fs),
+            "\n"
+          )
+
+          if (length(fs) != 56L) {
+            stop(
+              "Expected exactly 56 final posterior files; found ",
+              length(fs)
+            )
+          }
+
+          ix <- do.call(
+            rbind,
+            lapply(
+              fs,
+              function(f) {
+                z <- readRDS(f)
+
+                data.frame(
+                  Country=as.character(
+                    z$meta$country
+                  ),
+                  Chain=as.integer(
+                    z$meta$chain
+                  ),
+                  Burn=as.integer(
+                    z$meta$burn
+                  ),
+                  Keep=as.integer(
+                    z$meta$keep_internal
+                  ),
+                  Stored=as.integer(
+                    z$meta$stored_draws
+                  ),
+                  Panel=basename(
+                    as.character(
+                      z$meta$source_panel
+                    )
+                  ),
+                  Network=as.character(
+                    z$meta$main_network
+                  ),
+                  File=f,
+                  stringsAsFactors=FALSE
+                )
+              }
+            )
+          )
+
+          key <- paste(
+            ix$Country,
+            ix$Chain,
+            sep="||"
+          )
+
+          expected <- paste(
+            rep(
+              COUNTRIES,
+              each=4
+            ),
+            rep(
+              1:4,
+              times=length(COUNTRIES)
+            ),
+            sep="||"
+          )
+
+          if (anyDuplicated(key)) {
+            stop(
+              "Duplicated country-chain posterior."
+            )
+          }
+
+          if (!setequal(key, expected)) {
+            cat(
+              "Missing:\n",
+              paste(
+                setdiff(expected,key),
+                collapse="\n"
+              ),
+              "\n"
+            )
+
+            cat(
+              "Unexpected:\n",
+              paste(
+                setdiff(key,expected),
+                collapse="\n"
+              ),
+              "\n"
+            )
+
+            stop(
+              "Country-chain grid mismatch."
+            )
+          }
+
+          if (
+            any(
+              ix$Stored !=
+                stored_expected
+            )
+          ) {
+            stop(
+              "Stored draw count mismatch."
+            )
+          }
+
+          if (
+            any(
+              ix$Panel !=
+                "panel_domestic_fin3_rate_diff.csv"
+            )
+          ) {
+            stop(
+              "Non-Delta-r posterior detected."
+            )
+          }
+
+          if (
+            any(
+              ix$Network !=
+                "trade_2000_2012"
+            )
+          ) {
+            stop(
+              "Non-Trade-W posterior detected."
+            )
+          }
+
+          z0 <- ix[
+            ix$Country %in% original_countries,
+            ,
+            drop=FALSE
+          ]
+
+          z1 <- ix[
+            ix$Country %in% stage1_countries,
+            ,
+            drop=FALSE
+          ]
+
+          z2 <- ix[
+            ix$Country == stage2_country,
+            ,
+            drop=FALSE
+          ]
+
+          z3 <- ix[
+            ix$Country %in% stage3_countries,
+            ,
+            drop=FALSE
+          ]
+
+          stopifnot(nrow(z0) == 20L)
+          stopifnot(nrow(z1) == 24L)
+          stopifnot(nrow(z2) == 4L)
+          stopifnot(nrow(z3) == 8L)
+
+          if (
+            any(z0$Burn != 5000L) ||
+            any(z0$Keep != 10000L)
+          ) {
+            stop(
+              "Original retained-chain lengths mismatch."
+            )
+          }
+
+          if (
+            any(z1$Burn != 7500L) ||
+            any(z1$Keep != 20000L)
+          ) {
+            stop(
+              "10a retained-chain lengths mismatch."
+            )
+          }
+
+          if (
+            any(z2$Burn != 10000L) ||
+            any(z2$Keep != 40000L)
+          ) {
+            stop(
+              "10b retained NO chain lengths mismatch."
+            )
+          }
+
+          if (
+            any(z3$Burn != burn10c) ||
+            any(z3$Keep != keep10c)
+          ) {
+            stop(
+              "10c CN/SG chain lengths mismatch."
+            )
+          }
+
+          dir.create(
+            "results/10c_trade_rescue_audit",
+            recursive=TRUE,
+            showWarnings=FALSE
+          )
+
+          ix <- ix[
+            order(
+              ix$Country,
+              ix$Chain
+            ),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            ix,
+            "results/10c_trade_rescue_audit/00_final_mixed_posterior_index.csv",
+            row.names=FALSE
+          )
+
+          cat(
+            "10C FINAL 56-CHAIN POSTERIOR GRID: PASS\n"
+          )
+          RS
+
+      - name: Audit 10c sampler-transition metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fs=(
+            $(find posterior_parts \
+              -type f \
+              -name '00_sampler_transition_audit.csv' \
+              -print)
+          )
+
+          if [ "${#fs[@]}" -ne 8 ]; then
+            echo "::error::Expected 8 sampler-transition audit files; found ${#fs[@]}"
+            exit 1
+          fi
+
+          mkdir -p results/10c_trade_rescue_audit
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+
+          fs = list(
+              Path("posterior_parts").rglob(
+                  "00_sampler_transition_audit.csv"
+              )
+          )
+
+          if len(fs) != 8:
+              raise SystemExit(
+                  f"Expected 8 sampler audit files; found {len(fs)}"
+              )
+
+          x = pd.concat(
+              [pd.read_csv(f) for f in fs],
+              ignore_index=True
+          )
+
+          x = x.sort_values(
+              ["Country","Chain"]
+          )
+
+          if set(x["Country"]) != {"CN","SG"}:
+              raise SystemExit(
+                  "Unexpected countries in sampler audit."
+              )
+
+          if not (x["StatisticalModelChanged"] == False).all():
+              raise SystemExit(
+                  "Statistical model must remain unchanged."
+              )
+
+          if not (x["PriorChanged"] == False).all():
+              raise SystemExit(
+                  "Prior must remain unchanged."
+              )
+
+          if not (x["GateChanged"] == False).all():
+              raise SystemExit(
+                  "Convergence gate must remain unchanged."
+              )
+
+          x.to_csv(
+              "results/10c_trade_rescue_audit/01_sampler_transition_audit.csv",
+              index=False
+          )
+
+          print(x.to_string(index=False))
+          PY
+
+      - name: Audit 10c chain degeneracy reports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          fs <- list.files(
+            "posterior_parts",
+            pattern="^05_chain_degeneracy_audit[.]csv$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+
+          fs <- fs[
+            grepl(
+              "financial-3var-10c-trade-sv-rescue",
+              fs,
+              fixed=TRUE
+            )
+          ]
+
+          if (length(fs) != 8L) {
+            stop(
+              "Expected 8 10c degeneracy audits; found ",
+              length(fs)
+            )
+          }
+
+          x <- do.call(
+            rbind,
+            lapply(
+              fs,
+              function(f) {
+                read.csv(
+                  f,
+                  stringsAsFactors=FALSE,
+                  check.names=FALSE
+                )
+              }
+            )
+          )
+
+          x <- x[
+            order(
+              x$Country,
+              x$Chain
+            ),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            x,
+            "results/10c_trade_rescue_audit/02_chain_degeneracy_audit.csv",
+            row.names=FALSE
+          )
+
+          print(x)
+
+          if (
+            any(
+              x$Status != "PASS"
+            )
+          ) {
+            cat(
+              "::warning::At least one 10c chain has a machine-zero V0 warning.\n"
+            )
+          } else {
+            cat(
+              "10C CHAIN DEGENERACY AUDIT: ALL PASS\n"
+            )
+          }
+          RS
+
+      - name: Run unchanged formal MCMC convergence diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61_formal_mcmc_diagnostics.R
+
+      - name: Show convergence results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "================= MCMC GATE ================="
+          cat results/formal_tvp/00_formal_mcmc_gate.csv || true
+
+          echo
+          echo "============== COUNTRY SUMMARY =============="
+          cat results/formal_tvp/02_mcmc_country_summary.csv || true
+
+          echo
+
+      - name: Upload 10c convergence and audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10c-trade-convergence-trade_2000_2012-${{ github.run_id }}
+          path: |
+            results/formal_tvp/
+            results/10c_trade_rescue_audit/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce unchanged formal convergence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          g <- read.csv(
+            "results/formal_tvp/00_formal_mcmc_gate.csv",
+            stringsAsFactors=FALSE,
+            check.names=FALSE
+          )
+
+          print(g)
+
+          if (
+            nrow(g) != 1L ||
+            g$Status[1] != "READY_FOR_FORMAL_IRF"
+          ) {
+            stop(
+              paste0(
+                "10c Trade-W MCMC gate still failed. ",
+                "Do NOT run IRF and do NOT loosen thresholds. ",
+                "If CN/SG still fail, move to sampler/model-parameterization diagnosis."
+              )
+            )
+          }
+
+          cat("\n============================================\n")
+          cat("10C TRADE-W MCMC: READY_FOR_FORMAL_IRF\n")
+          cat("============================================\n")
+          RS
