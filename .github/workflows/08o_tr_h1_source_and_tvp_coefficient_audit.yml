@@ -1,0 +1,264 @@
+name: Financial 3var 08o TR h1 source and TVP coefficient audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_08j_run_id:
+        description: "Original Delta-r formal re-estimation run"
+        required: true
+        default: "33598683599"
+        type: string
+      source_08k_run_id:
+        description: "Accepted targeted long-chain rescue run"
+        required: true
+        default: "33804294933"
+        type: string
+      source_08l_run_id:
+        description: "Accepted NO/TR independent-seed run"
+        required: true
+        default: "33810122490"
+        type: string
+      source_08m_run_id:
+        description: "Accepted formal Delta-r IRF run"
+        required: true
+        default: "33814426556"
+        type: string
+      source_08m_ref:
+        description: "Exact accepted 08m head SHA"
+        required: true
+        default: "61d89441943a7d57c042cbef3d0bb3ce18359a4b"
+        type: string
+      source_08n_run_id:
+        description: "Accepted 08n heterogeneity/TR diagnostic run"
+        required: true
+        default: "33820678514"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN08J: ${{ inputs.source_08j_run_id }}
+      RUN08K: ${{ inputs.source_08k_run_id }}
+      RUN08L: ${{ inputs.source_08l_run_id }}
+      RUN08M: ${{ inputs.source_08m_run_id }}
+      REF08M: ${{ inputs.source_08m_ref }}
+      RUN08N: ${{ inputs.source_08n_run_id }}
+
+      FIN3_08J_RUN_ID: ${{ inputs.source_08j_run_id }}
+      FIN3_08K_RUN_ID: ${{ inputs.source_08k_run_id }}
+      FIN3_08L_RUN_ID: ${{ inputs.source_08l_run_id }}
+      FIN3_08M_RUN_ID: ${{ inputs.source_08m_run_id }}
+      FIN3_08N_RUN_ID: ${{ inputs.source_08n_run_id }}
+      FIN3_PARTS_ROOT: posterior_parts
+      FIN3_08M_ROOT: source_08m
+      FIN3_08N_ROOT: source_08n
+      FIN3_08O_OUT: results/tr_h1_source_tvp_audit
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: "2000"
+      FIN3_GPR_SHOCK_PCT: "10"
+      FIN3_IRF_MIN_G0_RCOND: "1e-10"
+      FIN3_08O_MIN_VALID_SHARE: "0.90"
+      FIN3_08O_REPRO_TOL: "1e-8"
+      FIN3_08O_ALGEBRA_TOL: "1e-10"
+      FIN3_RATE_DIFF_PANEL_BASENAME: "panel_domestic_fin3_rate_diff.csv"
+
+    steps:
+      - name: Checkout current 08o code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify accepted source runs and unchanged IRF algebra
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f R/69_tr_h1_source_and_event_coefficient_tvp_audit.R || {
+            echo "::error::Missing R/69_tr_h1_source_and_event_coefficient_tvp_audit.R"
+            exit 1
+          }
+
+          J="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08J}")"
+          K="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08K}")"
+          L="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08L}")"
+          M="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08M}")"
+          N="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN08N}")"
+
+          test "$(jq -r '.status' <<<"${J}")" = "completed"
+          test "$(jq -r '.status' <<<"${K}")" = "completed"
+          test "$(jq -r '.status' <<<"${L}")" = "completed"
+          test "$(jq -r '.status' <<<"${M}")" = "completed"
+          test "$(jq -r '.status' <<<"${N}")" = "completed"
+
+          test "$(jq -r '.conclusion' <<<"${L}")" = "success"
+          test "$(jq -r '.conclusion' <<<"${M}")" = "success"
+          test "$(jq -r '.conclusion' <<<"${N}")" = "success"
+
+          test "$(jq -r '.head_sha' <<<"${M}")" = "${REF08M}" || {
+            echo "::error::08m head SHA mismatch."
+            exit 1
+          }
+          test "$(jq -r '.path' <<<"${M}")" = ".github/workflows/08m_formal_rate_diff_gpr_tvp_irf.yml"
+          test "$(jq -r '.path' <<<"${N}")" = ".github/workflows/08n_event_heterogeneity_safe_haven_tr_audit.yml"
+
+          git diff --exit-code "${REF08M}" -- \
+            R/00_config.R \
+            R/67_formal_rate_diff_gpr_tvp_irf.R || {
+              echo "::error::Current GVAR/IRF algebra differs from accepted 08m ref."
+              exit 1
+            }
+
+          echo "08O SOURCE RUNS + ACCEPTED R67 ALGEBRA: PASS"
+
+      - name: Download exact 08j prepared input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08j-rate-diff-input-${{ inputs.source_08j_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08j_run_id }}
+
+      - name: Rebuild exact accepted 56 posterior parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p posterior_parts
+
+          gh run download "${RUN08J}" \
+            --pattern "financial-3var-08j-rate-diff-part-*" \
+            --dir posterior_parts
+
+          shopt -s nullglob
+          for cc in AU BR CN NO SG TR; do
+            d=(posterior_parts/financial-3var-08j-rate-diff-part-${cc}-chain*-${RUN08J})
+            test "${#d[@]}" -eq 4 || {
+              echo "::error::Expected four 08j dirs for ${cc}; found ${#d[@]}"
+              exit 1
+            }
+            rm -rf "${d[@]}"
+          done
+
+          gh run download "${RUN08K}" \
+            --pattern "financial-3var-08k-rate-diff-rescue-*" \
+            --dir posterior_parts
+
+          for cc in NO TR; do
+            d=(posterior_parts/financial-3var-08k-rate-diff-rescue-${cc}-chain*-${RUN08K})
+            test "${#d[@]}" -eq 4 || {
+              echo "::error::Expected four 08k dirs for ${cc}; found ${#d[@]}"
+              exit 1
+            }
+            rm -rf "${d[@]}"
+          done
+
+          gh run download "${RUN08L}" \
+            --pattern "financial-3var-08l-new-seed-*" \
+            --dir posterior_parts
+
+          RDS_COUNT="$(find posterior_parts -type f -name 'formal_tvp_*_chain*.rds' | wc -l)"
+          test "${RDS_COUNT}" -eq 56 || {
+            echo "::error::Expected 56 final posterior RDS files; found ${RDS_COUNT}."
+            exit 1
+          }
+
+          echo "08O 56-PART LINEAGE REBUILT: PASS"
+
+      - name: Download accepted 08m formal IRF artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08m-formal-rate-diff-irf-${{ inputs.source_08m_run_id }}
+          path: source_08m
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08m_run_id }}
+
+      - name: Download accepted 08n diagnostic artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-08n-event-heterogeneity-safe-haven-tr-${{ inputs.source_08n_run_id }}
+          path: source_08n
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_08n_run_id }}
+
+      - name: Verify source artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f source_08m/formal_irf_rate_diff/00_formal_rate_diff_irf_gate.csv
+          test -f source_08m/formal_irf_rate_diff/irf_posterior_summary.csv
+          test -f source_08n/00_08n_gate.csv
+          test -f source_08n/08_tr_raw_reer_path.csv
+          test -f source_08n/09_tr_h1_dominance_decomposition.csv
+          echo "08O SOURCE ARTIFACTS: PASS"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Run exact TR h1 source decomposition and TVP coefficient audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/69_tr_h1_source_and_event_coefficient_tvp_audit.R
+
+      - name: Enforce 08o diagnostic integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            f <- "results/tr_h1_source_tvp_audit/00_08o_gate.csv"
+            if (!file.exists(f)) stop("Missing 08o gate.")
+            g <- read.csv(f, stringsAsFactors=FALSE, check.names=FALSE)
+            if (nrow(g)!=1L || g$Status[1]!="DIAGNOSTIC_COMPLETE") stop("08o did not complete.")
+            if (g$PosteriorFiles[1]!=56L) stop("Posterior lineage mismatch.")
+            if (g$PosteriorDrawsPerCoreEvent[1]!=8000L) stop("Posterior draw count mismatch.")
+            if (g$CoreEvents[1]!=6L) stop("Core event count mismatch.")
+            if (g$Max08mReproductionGap[1]>1e-8) stop("08m reproduction gate failed.")
+            if (g$MaxAlgebraReconciliationError[1]>1e-10) stop("h1 algebra reconciliation failed.")
+            if (isTRUE(g$ReestimationPerformed[1])) stop("08o must not re-estimate.")
+            if (isTRUE(g$ModelSpecificationChanged[1])) stop("08o must not change model.")
+            if (isTRUE(g$WeightMatrixChanged[1])) stop("08o must not change W.")
+            cat("08O DIAGNOSTIC INTEGRITY: PASS\n")
+            print(g)
+          '
+
+      - name: Show compact 08o results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== 08O GATE ==="
+          cat results/tr_h1_source_tvp_audit/00_08o_gate.csv || true
+          echo
+          echo "=== EXACT H1 DECOMPOSITION ==="
+          cat results/tr_h1_source_tvp_audit/01_tr_h1_exact_decomposition_summary.csv || true
+          echo
+          echo "=== TR GPR_L1 COUNTERFACTUAL ==="
+          cat results/tr_h1_source_tvp_audit/04_tr_de_gpr_l1_counterfactual.csv || true
+          echo
+          echo "=== REPRODUCTION VS 08M ==="
+          cat results/tr_h1_source_tvp_audit/05_reconciliation_with_accepted_08m.csv || true
+          echo
+          echo "=== TR/DE KEY TV PROBABILITY ==="
+          cat results/tr_h1_source_tvp_audit/13_tr_de_key_term_time_variation_probability.csv || true
+
+      - name: Upload 08o diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-08o-tr-h1-source-tvp-audit-${{ github.run_id }}
+          path: results/tr_h1_source_tvp_audit
+          if-no-files-found: error
+          retention-days: 30
