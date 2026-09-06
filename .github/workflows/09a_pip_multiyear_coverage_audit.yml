@@ -1,0 +1,115 @@
+name: Financial 3var 09a IMF PIP multiyear coverage audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: "First annual PIP year to audit"
+        required: true
+        default: "2015"
+        type: string
+      end_year:
+        description: "Last confirmed end-year PIP period to audit"
+        required: true
+        default: "2024"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  pip_coverage_audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      FIN3_PIP_START_YEAR: ${{ inputs.start_year }}
+      FIN3_PIP_END_YEAR: ${{ inputs.end_year }}
+      FIN3_PIP_AUDIT_OUT: results/pip_multiyear_coverage_audit
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify audit code and current 14-economy definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f R/71_pip_multiyear_financial_weight_coverage_audit.R
+          test -f R/00_config.R
+          grep -q 'AU.*BR.*CA.*CH.*CN.*EA.*UK.*JP.*KR.*NO.*SG.*TR.*US.*ZA' R/00_config.R
+          echo "09A SOURCE CONTRACT: PASS"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install current rsdmx with IMF_DATA provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            install.packages("remotes", repos="https://cloud.r-project.org")
+            remotes::install_github("opensdmx/rsdmx", upgrade="never")
+            stopifnot(requireNamespace("rsdmx", quietly=TRUE))
+            p <- rsdmx::getSDMXServiceProviders()
+            ids <- vapply(methods::slot(p,"providers"), function(x) methods::slot(x,"agencyId"), "")
+            if (!("IMF_DATA" %in% ids)) stop("Installed rsdmx does not contain IMF_DATA provider.")
+            cat("RSDMX IMF_DATA PROVIDER: PASS\n")
+          '
+
+      - name: Run strict official IMF PIP coverage audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/71_pip_multiyear_financial_weight_coverage_audit.R
+
+      - name: Enforce no-imputation audit contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e '
+            f <- "results/pip_multiyear_coverage_audit/00_pip_coverage_gate.csv"
+            if (!file.exists(f)) stop("Missing PIP coverage gate.")
+            g <- read.csv(f, stringsAsFactors=FALSE, check.names=FALSE)
+            if (nrow(g) != 1L) stop("Malformed gate.")
+            if (!grepl("^AUDIT_COMPLETE_", g$Status[1])) stop("PIP audit did not complete.")
+            forbidden <- c(
+              "MissingTreatedAsZero","SuppressedTreatedAsZero",
+              "NegativePairClippedToZero","MirrorImputationUsed",
+              "InterpolationUsed","CarryForwardUsed"
+            )
+            for (x in forbidden) {
+              if (isTRUE(g[[x]][1])) stop("Forbidden data treatment activated: ", x)
+            }
+            cat("09A NO-IMPUTATION CONTRACT: PASS\n")
+            print(g)
+          '
+
+      - name: Show strict coverage summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== PIP COVERAGE GATE ==="
+          cat results/pip_multiyear_coverage_audit/00_pip_coverage_gate.csv || true
+          echo
+          echo "=== YEAR COVERAGE ==="
+          cat results/pip_multiyear_coverage_audit/07_year_coverage_summary.csv || true
+          echo
+          echo "=== COUNTRY-YEAR ROW COVERAGE ==="
+          cat results/pip_multiyear_coverage_audit/08_country_year_row_coverage.csv || true
+          echo
+          echo "=== FIRST MISSING/AMBIGUOUS/NEGATIVE CELLS ==="
+          head -n 41 results/pip_multiyear_coverage_audit/06_missing_ambiguous_negative_underlying_cells.csv || true
+
+      - name: Upload strict PIP coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-09a-pip-multiyear-coverage-${{ github.run_id }}
+          path: results/pip_multiyear_coverage_audit
+          if-no-files-found: error
+          retention-days: 30
