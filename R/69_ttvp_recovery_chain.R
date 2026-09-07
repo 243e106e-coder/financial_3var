@@ -427,10 +427,73 @@ for (eq_name in equations) {
     stopf("Unexpected A structure.")
   }
   nstored_raw <- dim(post$A)[1]
-  if (nstored_raw != STORED + 1L) {
-    stopf("Expected %d raw draws, found %d.", STORED+1L,nstored_raw)
+
+  # threshtvp constructs its storage grid from
+  #   length.out = thin * nsave
+  # where `thin` is floating point.  For example, with
+  # STORED=1000 and KEEP=15000,
+  #
+  #   ((STORED + 1) / KEEP) * KEEP
+  #
+  # can evaluate to 1001.0000000000001, so R may create 1002 raw storage
+  # points rather than 1001.  This is storage-grid bookkeeping, not an
+  # additional MCMC target or a statistical-model change.
+  #
+  # Contract:
+  #   1) raw draw 1 is the burn-boundary draw and is always discarded;
+  #   2) at least STORED strictly post-burn raw draws must remain;
+  #   3) select exactly STORED draws deterministically and approximately
+  #      evenly across the available strictly post-burn storage grid.
+  if (nstored_raw < STORED + 1L) {
+    stopf(
+      "Too few raw draws: need at least %d (burn boundary + %d post-burn), found %d.",
+      STORED + 1L, STORED, nstored_raw
+    )
   }
-  keep_draw <- 2:nstored_raw
+
+  postburn_candidates <- 2:nstored_raw
+  n_candidates <- length(postburn_candidates)
+  if (n_candidates < STORED) {
+    stopf(
+      "Too few strictly post-burn candidates: need %d, found %d.",
+      STORED, n_candidates
+    )
+  }
+
+  if (n_candidates == STORED) {
+    select_pos <- seq_len(STORED)
+  } else {
+    select_pos <- as.integer(round(
+      seq(1, n_candidates, length.out = STORED)
+    ))
+  }
+
+  if (length(select_pos) != STORED ||
+      length(unique(select_pos)) != STORED ||
+      min(select_pos) < 1L ||
+      max(select_pos) > n_candidates) {
+    stopf(
+      "Post-burn deterministic selection failed: candidates=%d selected=%d unique=%d.",
+      n_candidates, length(select_pos), length(unique(select_pos))
+    )
+  }
+
+  keep_draw <- postburn_candidates[select_pos]
+
+  if (length(keep_draw) != STORED ||
+      any(keep_draw <= 1L) ||
+      any(diff(keep_draw) <= 0L)) {
+    stopf("Strict post-burn draw contract failed after selection.")
+  }
+
+  msg(
+    paste0(
+      "10n draw bookkeeping: raw=%d; burn-boundary dropped=1; ",
+      "post-burn candidates=%d; selected=%d; first_raw_index=%d; last_raw_index=%d"
+    ),
+    nstored_raw, n_candidates, length(keep_draw),
+    min(keep_draw), max(keep_draw)
+  )
 
   Astd <- post$A[keep_draw,,,drop=FALSE]
   Ddyn <- post$D_dyn[keep_draw,,,drop=FALSE]
@@ -439,6 +502,16 @@ for (eq_name in equations) {
   V0 <- post$V0[keep_draw,,drop=FALSE]
   H <- post$H[keep_draw,,drop=FALSE]
   svp <- post$svparms[keep_draw,,drop=FALSE]
+
+  if (dim(Astd)[1] != STORED ||
+      dim(Ddyn)[1] != STORED ||
+      nrow(thresholds) != STORED ||
+      nrow(omega) != STORED ||
+      nrow(V0) != STORED ||
+      nrow(H) != STORED ||
+      nrow(svp) != STORED) {
+    stopf("Selected posterior objects do not all contain exactly STORED draws.")
+  }
 
   if (dim(Astd)[2] != length(model_quarters) ||
       dim(Astd)[3] != length(TERMS)) {
