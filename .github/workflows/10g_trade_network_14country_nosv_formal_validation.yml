@@ -1,0 +1,910 @@
+name: Financial 3var 10g Trade-W 14-country no-SV formal validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Original Trade-W run containing exact validated input artifact"
+        required: true
+        default: "34056102906"
+        type: string
+
+      model_ref:
+        description: "Exact statistical-model code SHA"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+
+      burn_per_chain:
+        description: "Burn-in per chain"
+        required: true
+        default: "12500"
+        type: string
+
+      postburn_per_chain:
+        description: "Internal post-burn MCMC iterations per chain"
+        required: true
+        default: "50000"
+        type: string
+
+      stored_per_chain:
+        description: "Strictly post-burn stored draws per chain"
+        required: true
+        default: "2000"
+        type: string
+
+      seed_base:
+        description: "Fresh independent seed base"
+        required: true
+        default: "20265091"
+        type: string
+
+      max_parallel:
+        description: "Maximum simultaneous country-chain jobs"
+        required: true
+        default: "14"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify_input:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+      MODEL_REF: ${{ inputs.model_ref }}
+
+    steps:
+      - name: Checkout exact model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Verify exact code and input artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "${MODEL_REF}" || {
+            echo "::error::Checked-out SHA does not equal model_ref."
+            exit 1
+          }
+
+          for f in \
+            R/00_config.R \
+            R/60_formal_bayesian_tvp_gvar.R \
+            R/61_formal_mcmc_diagnostics.R
+          do
+            test -f "${f}" || {
+              echo "::error::Missing ${f}"
+              exit 1
+            }
+          done
+
+          run_json="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGINAL_RUN_ID}"
+          )"
+
+          test "$(jq -r '.status' <<<"${run_json}")" = "completed" || {
+            echo "::error::Original run is not completed."
+            exit 1
+          }
+
+          test "$(jq -r '.path' <<<"${run_json}")" = \
+            ".github/workflows/10_trade_network_end_to_end.yml" || {
+            echo "::error::Unexpected original workflow path."
+            exit 1
+          }
+
+          artifact_name="financial-3var-10-trade-input-trade_2000_2012-${ORIGINAL_RUN_ID}"
+
+          n="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGINAL_RUN_ID}/artifacts?per_page=100" \
+              --jq \
+              "[.artifacts[]
+                | select(
+                    .expired == false
+                    and .name == \"${artifact_name}\"
+                  )
+               ] | length"
+          )"
+
+          test "${n}" = "1" || {
+            echo "::error::Expected exactly one original Trade-W input artifact; found ${n}."
+            exit 1
+          }
+
+          echo "10G INPUT INTEGRITY: PASS"
+
+  estimate:
+    needs: verify_input
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        country: [AU, BR, CA, CH, CN, EA, UK, JP, KR, NO, SG, TR, US, ZA]
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+
+      FIN3_SV_ON: "false"
+      FIN3_TVS_ON: "true"
+
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+
+    steps:
+      - name: Checkout exact model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Download exact original Trade-W input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify 10g formal specification contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+
+          case "${FIN3_COUNTRY}" in
+            AU|BR|CA|CH|CN|EA|UK|JP|KR|NO|SG|TR|US|ZA) ;;
+            *)
+              echo "::error::Unexpected country ${FIN3_COUNTRY}"
+              exit 1
+              ;;
+          esac
+
+          test "${FIN3_NETWORK}" = "trade_2000_2012"
+          test "${FIN3_SV_ON}" = "false"
+          test "${FIN3_TVS_ON}" = "true"
+          test "${FIN3_TTVP_B1}" = "2"
+          test "${FIN3_TTVP_B2}" = "1"
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4"
+
+          python3 - <<'PY'
+          import os
+
+          burn = int(os.environ["FIN3_BURN"])
+          keep = int(os.environ["FIN3_KEEP"])
+          stored = int(os.environ["FIN3_STORED_PER_CHAIN"])
+
+          if burn < 5000:
+              raise SystemExit("burn_per_chain must be >= 5000.")
+          if keep < 10000:
+              raise SystemExit("postburn_per_chain must be >= 10000.")
+          if stored < 1000:
+              raise SystemExit("stored_per_chain must be >= 1000.")
+          if stored >= keep:
+              raise SystemExit("stored_per_chain must be smaller than postburn_per_chain.")
+          PY
+
+          echo "=============================================="
+          echo "10G UNIFIED NO-SV FORMAL SPECIFICATION"
+          echo "country=${FIN3_COUNTRY}"
+          echo "chain=${FIN3_CHAIN_ID}"
+          echo "network=${FIN3_NETWORK}"
+          echo "TVS=${FIN3_TVS_ON}"
+          echo "SV=${FIN3_SV_ON}"
+          echo "B1=${FIN3_TTVP_B1}"
+          echo "B2=${FIN3_TTVP_B2}"
+          echo "kappa0=${FIN3_TTVP_KAPPA0}"
+          echo "burn=${FIN3_BURN}"
+          echo "postburn=${FIN3_KEEP}"
+          echo "stored=${FIN3_STORED_PER_CHAIN}"
+          echo "seed_base=${FIN3_SEED_BASE}"
+          echo "=============================================="
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install exact pinned threshtvp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+
+          rm -rf threshtvp_src
+          git clone \
+            https://github.com/gregorkastner/threshtvp.git \
+            threshtvp_src
+
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          test "$(git -C threshtvp_src rev-parse HEAD)" = "${THRESHTVP_SHA}"
+
+          find threshtvp_src/src \
+            -maxdepth 1 \
+            -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+          Rscript --vanilla - <<'RS'
+          stopifnot(requireNamespace("threshtvp", quietly=TRUE))
+          cat("Pinned threshtvp installed.\n")
+          RS
+
+      - name: Record 10g specification audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          root="results/formal_tvp_parts/${FIN3_COUNTRY}/chain_${FIN3_CHAIN_ID}"
+          mkdir -p "${root}"
+
+          cat > "${root}/00_10g_specification_audit.csv" <<EOF
+          Country,Chain,StatisticalModelSHA,ThreshtvpSHA,Network,Panel,TVS,SV,B1,B2,Kappa0,Burn,PostBurnInternal,StoredDraws,SeedBase
+          ${FIN3_COUNTRY},${FIN3_CHAIN_ID},${{ inputs.model_ref }},c0133f262fcf0f935805168f8b7def02b43dc6d5,trade_2000_2012,panel_domestic_fin3_rate_diff.csv,TRUE,FALSE,2,1,1e-4,${FIN3_BURN},${FIN3_KEEP},${FIN3_STORED_PER_CHAIN},${FIN3_SEED_BASE}
+          EOF
+
+      - name: Run unified no-SV formal MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          source("R/00_config.R")
+
+          if (MAIN_NETWORK != "trade_2000_2012") {
+            stop("Unexpected network: ", MAIN_NETWORK)
+          }
+
+          if (!file.exists(network_path(MAIN_NETWORK))) {
+            stop("Selected Trade-W matrix missing.")
+          }
+
+          cat("MAIN_NETWORK=", MAIN_NETWORK, "\n")
+          RS
+
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Validate posterior metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          cc <- Sys.getenv("FIN3_COUNTRY")
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+
+          root <- file.path(
+            "results",
+            "formal_tvp_parts",
+            cc,
+            paste0("chain_", ch)
+          )
+
+          f <- list.files(
+            root,
+            pattern=paste0(
+              "^formal_tvp_",
+              cc,
+              "_chain",
+              ch,
+              "[.]rds$"
+            ),
+            full.names=TRUE
+          )
+
+          if (length(f) != 1L) {
+            stop(
+              "Expected exactly one posterior RDS; found ",
+              length(f)
+            )
+          }
+
+          z <- readRDS(f)
+
+          stopifnot(as.character(z$meta$country) == cc)
+          stopifnot(as.integer(z$meta$chain) == ch)
+
+          stopifnot(
+            as.integer(z$meta$burn) ==
+              as.integer(Sys.getenv("FIN3_BURN"))
+          )
+
+          stopifnot(
+            as.integer(z$meta$keep_internal) ==
+              as.integer(Sys.getenv("FIN3_KEEP"))
+          )
+
+          stopifnot(
+            as.integer(z$meta$stored_draws) ==
+              as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN"))
+          )
+
+          stopifnot(!isTRUE(z$meta$sv_on))
+          stopifnot(isTRUE(z$meta$tvs_on))
+
+          stopifnot(
+            abs(as.numeric(z$meta$prior_B1)-2) < 1e-12
+          )
+
+          stopifnot(
+            abs(as.numeric(z$meta$prior_B2)-1) < 1e-12
+          )
+
+          stopifnot(
+            abs(as.numeric(z$meta$kappa0)-1e-4) < 1e-12
+          )
+
+          stopifnot(
+            basename(as.character(z$meta$source_panel)) ==
+              "panel_domestic_fin3_rate_diff.csv"
+          )
+
+          stopifnot(
+            as.character(z$meta$main_network) ==
+              "trade_2000_2012"
+          )
+
+          cat("10G POSTERIOR METADATA: PASS\n")
+          RS
+
+      - name: Build per-chain V0 numerical-degeneracy audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          cc <- Sys.getenv("FIN3_COUNTRY")
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+
+          root <- file.path(
+            "results",
+            "formal_tvp_parts",
+            cc,
+            paste0("chain_", ch)
+          )
+
+          f <- file.path(
+            root,
+            "02_chain_monitor_summary.csv"
+          )
+
+          if (!file.exists(f)) {
+            stop("Missing chain monitor summary: ", f)
+          }
+
+          x <- read.csv(
+            f,
+            stringsAsFactors=FALSE,
+            check.names=FALSE
+          )
+
+          need <- c("Parameter","Mean","SD")
+
+          if (!all(need %in% names(x))) {
+            stop("Unexpected chain-monitor schema.")
+          }
+
+          v0 <- grepl(
+            "__V0__",
+            x$Parameter,
+            fixed=TRUE
+          )
+
+          # Same conservative numerical-collapse audit used in 10c:
+          # a V0 is flagged only when both its mean and within-chain SD
+          # are effectively machine-zero on the scale of the monitored draw.
+          degenerate <- (
+            v0 &
+            is.finite(x$Mean) &
+            is.finite(x$SD) &
+            abs(x$Mean) < 1e-12 &
+            x$SD < 1e-14
+          )
+
+          audit <- data.frame(
+            Country=cc,
+            Chain=ch,
+            MonitoredParameters=nrow(x),
+            V0Parameters=sum(v0),
+            DegenerateV0Parameters=sum(degenerate),
+            Status=ifelse(
+              any(degenerate),
+              "FAIL_DEGENERATE_V0",
+              "PASS"
+            ),
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(
+            audit,
+            file.path(
+              root,
+              "05_chain_degeneracy_audit.csv"
+            ),
+            row.names=FALSE
+          )
+
+          if (any(degenerate)) {
+            write.csv(
+              x[degenerate,,drop=FALSE],
+              file.path(
+                root,
+                "06_degenerate_parameters.csv"
+              ),
+              row.names=FALSE
+            )
+
+            cat(
+              "::warning::Numerically degenerate V0 parameter(s) detected.\n"
+            )
+          } else {
+            cat("10G CHAIN DEGENERACY AUDIT: PASS\n")
+          }
+          RS
+
+      - name: Upload 10g posterior part
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10g-nosv-trade_2000_2012-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  diagnose:
+    needs: [verify_input, estimate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_PARTS_ROOT: "posterior_parts"
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+
+      FIN3_EXPECTED_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_EXPECTED_KEEP: ${{ inputs.postburn_per_chain }}
+
+    steps:
+      - name: Checkout exact model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Download all 56 no-SV posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10g-nosv-trade_2000_2012-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Verify exact 14 x 4 no-SV posterior contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p results/10g_nosv_audit
+
+          Rscript --vanilla - <<'RS'
+          source("R/00_config.R")
+
+          files <- list.files(
+            "posterior_parts",
+            pattern="^formal_tvp_[A-Z]{2}_chain[1-4][.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+
+          if (length(files) != 56L) {
+            stop(
+              "Expected exactly 56 posterior RDS files; found ",
+              length(files)
+            )
+          }
+
+          idx <- do.call(
+            rbind,
+            lapply(
+              files,
+              function(f) {
+                z <- readRDS(f)
+
+                data.frame(
+                  Country=as.character(z$meta$country),
+                  Chain=as.integer(z$meta$chain),
+                  Burn=as.integer(z$meta$burn),
+                  Keep=as.integer(z$meta$keep_internal),
+                  Stored=as.integer(z$meta$stored_draws),
+                  SV=isTRUE(z$meta$sv_on),
+                  TVS=isTRUE(z$meta$tvs_on),
+                  B1=as.numeric(z$meta$prior_B1),
+                  B2=as.numeric(z$meta$prior_B2),
+                  Kappa0=as.numeric(z$meta$kappa0),
+                  Network=as.character(z$meta$main_network),
+                  Panel=basename(as.character(z$meta$source_panel)),
+                  File=f,
+                  stringsAsFactors=FALSE
+                )
+              }
+            )
+          )
+
+          key <- paste(
+            idx$Country,
+            idx$Chain,
+            sep="||"
+          )
+
+          expected <- paste(
+            rep(COUNTRIES, each=4),
+            rep(1:4, times=length(COUNTRIES)),
+            sep="||"
+          )
+
+          if (anyDuplicated(key)) {
+            stop("Duplicate country-chain posterior.")
+          }
+
+          if (!setequal(key, expected)) {
+            cat(
+              "Missing keys:\n",
+              paste(setdiff(expected,key),collapse="\n"),
+              "\n"
+            )
+            cat(
+              "Unexpected keys:\n",
+              paste(setdiff(key,expected),collapse="\n"),
+              "\n"
+            )
+            stop("Country-chain grid mismatch.")
+          }
+
+          expected_burn <- as.integer(
+            Sys.getenv("FIN3_EXPECTED_BURN")
+          )
+
+          expected_keep <- as.integer(
+            Sys.getenv("FIN3_EXPECTED_KEEP")
+          )
+
+          expected_stored <- as.integer(
+            Sys.getenv("FIN3_STORED_PER_CHAIN")
+          )
+
+          if (any(idx$Burn != expected_burn)) {
+            stop("Burn mismatch.")
+          }
+
+          if (any(idx$Keep != expected_keep)) {
+            stop("Post-burn iteration mismatch.")
+          }
+
+          if (any(idx$Stored != expected_stored)) {
+            stop("Stored-draw mismatch.")
+          }
+
+          if (any(idx$SV)) {
+            stop("At least one 10g posterior unexpectedly used SV=TRUE.")
+          }
+
+          if (!all(idx$TVS)) {
+            stop("At least one 10g posterior unexpectedly used TVS=FALSE.")
+          }
+
+          if (any(abs(idx$B1-2) > 1e-12)) {
+            stop("B1 mismatch.")
+          }
+
+          if (any(abs(idx$B2-1) > 1e-12)) {
+            stop("B2 mismatch.")
+          }
+
+          if (any(abs(idx$Kappa0-1e-4) > 1e-12)) {
+            stop("kappa0 mismatch.")
+          }
+
+          if (any(idx$Network != "trade_2000_2012")) {
+            stop("Network mismatch.")
+          }
+
+          if (
+            any(
+              idx$Panel !=
+                "panel_domestic_fin3_rate_diff.csv"
+            )
+          ) {
+            stop("Panel mismatch.")
+          }
+
+          idx <- idx[
+            order(match(idx$Country,COUNTRIES),idx$Chain),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            idx,
+            "results/10g_nosv_audit/00_posterior_contract.csv",
+            row.names=FALSE
+          )
+
+          specification <- data.frame(
+            Item=c(
+              "Economies",
+              "ChainsPerEconomy",
+              "Network",
+              "Panel",
+              "TVS",
+              "SV",
+              "B1",
+              "B2",
+              "Kappa0",
+              "BurnPerChain",
+              "PostBurnInternalPerChain",
+              "StoredDrawsPerChain"
+            ),
+            Value=c(
+              length(COUNTRIES),
+              4,
+              "trade_2000_2012",
+              "panel_domestic_fin3_rate_diff.csv",
+              "TRUE",
+              "FALSE",
+              "2",
+              "1",
+              "1e-4",
+              expected_burn,
+              expected_keep,
+              expected_stored
+            ),
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(
+            specification,
+            "results/10g_nosv_audit/01_specification_contract.csv",
+            row.names=FALSE
+          )
+
+          cat("10G 56-CHAIN NO-SV CONTRACT: PASS\n")
+          RS
+
+      - name: Aggregate numerical-degeneracy audits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          fs <- list.files(
+            "posterior_parts",
+            pattern="^05_chain_degeneracy_audit[.]csv$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+
+          if (length(fs) != 56L) {
+            stop(
+              "Expected 56 chain degeneracy audits; found ",
+              length(fs)
+            )
+          }
+
+          x <- do.call(
+            rbind,
+            lapply(
+              fs,
+              function(f) {
+                read.csv(
+                  f,
+                  stringsAsFactors=FALSE,
+                  check.names=FALSE
+                )
+              }
+            )
+          )
+
+          x <- x[
+            order(x$Country,x$Chain),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            x,
+            "results/10g_nosv_audit/02_chain_degeneracy_audit.csv",
+            row.names=FALSE
+          )
+
+          cat(
+            "Degenerate chains: ",
+            sum(x$Status != "PASS"),
+            "\n",
+            sep=""
+          )
+
+          if (any(x$Status != "PASS")) {
+            bad <- x[x$Status!="PASS",,drop=FALSE]
+            print(bad)
+            cat(
+              "::warning::At least one chain failed the V0 numerical-degeneracy audit.\n"
+            )
+          } else {
+            cat("10G ALL 56 CHAIN DEGENERACY AUDITS: PASS\n")
+          }
+          RS
+
+      - name: Run unchanged formal 14-country MCMC diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61_formal_mcmc_diagnostics.R
+
+      - name: Show formal convergence results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "================ FORMAL MCMC GATE ================"
+          cat results/formal_tvp/00_formal_mcmc_gate.csv || true
+
+          echo
+          echo "================ COUNTRY SUMMARY ================="
+          cat results/formal_tvp/02_mcmc_country_summary.csv || true
+
+          echo
+
+      - name: Upload 10g formal validation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10g-nosv-formal-validation-trade_2000_2012-${{ github.run_id }}
+          path: |
+            results/formal_tvp/
+            results/10g_nosv_audit/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce combined formal convergence and numerical gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          gate <- read.csv(
+            "results/formal_tvp/00_formal_mcmc_gate.csv",
+            stringsAsFactors=FALSE,
+            check.names=FALSE
+          )
+
+          deg <- read.csv(
+            "results/10g_nosv_audit/02_chain_degeneracy_audit.csv",
+            stringsAsFactors=FALSE,
+            check.names=FALSE
+          )
+
+          if (nrow(gate) != 1L) {
+            stop("Malformed formal MCMC gate.")
+          }
+
+          formal_ready <- (
+            gate$Status[1] ==
+              "READY_FOR_FORMAL_IRF"
+          )
+
+          numerical_ready <- (
+            nrow(deg) == 56L &&
+            all(deg$Status == "PASS")
+          )
+
+          final <- data.frame(
+            FormalMCMCGate=gate$Status[1],
+            All56ChainDegeneracyAuditsPass=numerical_ready,
+            FinalStatus=ifelse(
+              formal_ready && numerical_ready,
+              "READY_FOR_FORMAL_IRF",
+              "FAIL"
+            ),
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(
+            final,
+            "results/10g_nosv_audit/03_final_10g_gate.csv",
+            row.names=FALSE
+          )
+
+          print(gate)
+          print(final)
+
+          if (!formal_ready) {
+            stop(
+              paste0(
+                "10g no-SV formal MCMC gate failed. ",
+                "Do NOT run IRF and do NOT loosen thresholds."
+              )
+            )
+          }
+
+          if (!numerical_ready) {
+            stop(
+              paste0(
+                "10g formal Rhat/ESS gate passed but at least one ",
+                "chain failed the V0 numerical-degeneracy audit. ",
+                "Do NOT run IRF."
+              )
+            )
+          }
+
+          cat("\n==============================================\n")
+          cat("10G 14-COUNTRY NO-SV: READY_FOR_FORMAL_IRF\n")
+          cat("==============================================\n")
+          RS
