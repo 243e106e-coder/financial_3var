@@ -287,7 +287,7 @@ jobs:
                   "Expected exactly one original svdraw initialization inside MCMC_tvp()."
               )
 
-          new_init = "\\n".join([
+          new_init = "\n".join([
               '    sv_init_mode <- tolower(trimws(Sys.getenv("FIN3_SV_INIT_MODE", "legacy")))',
               '    if (sv_init_mode == "legacy") {',
               '      svdraw <- list(',
