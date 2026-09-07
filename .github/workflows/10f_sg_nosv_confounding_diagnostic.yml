@@ -1,0 +1,415 @@
+name: Financial 3var 10f SG no-SV confounding diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Original Trade-W run containing exact input artifact"
+        required: true
+        default: "34056102906"
+        type: string
+
+      model_ref:
+        description: "Exact statistical-model code SHA"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+
+      burn_per_chain:
+        description: "SG diagnostic burn-in"
+        required: true
+        default: "12500"
+        type: string
+
+      postburn_per_chain:
+        description: "SG diagnostic internal post-burn iterations"
+        required: true
+        default: "50000"
+        type: string
+
+      stored_per_chain:
+        description: "Strictly post-burn stored draws"
+        required: true
+        default: "2000"
+        type: string
+
+      seed_base:
+        description: "Fresh independent seed base"
+        required: true
+        default: "20264573"
+        type: string
+
+      max_parallel:
+        description: "Maximum simultaneous jobs"
+        required: true
+        default: "4"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  estimate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_COUNTRY: "SG"
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+
+      FIN3_SV_ON: "false"
+      FIN3_TVS_ON: "true"
+
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+
+    steps:
+      - name: Checkout exact model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Download exact original Trade-W input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify SG no-SV diagnostic contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+
+          test "${FIN3_COUNTRY}" = "SG"
+          test "${FIN3_NETWORK}" = "trade_2000_2012"
+          test "${FIN3_SV_ON}" = "false"
+          test "${FIN3_TVS_ON}" = "true"
+          test "${FIN3_TTVP_B1}" = "2"
+          test "${FIN3_TTVP_B2}" = "1"
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4"
+
+          echo "10F DIAGNOSTIC CONTRACT:"
+          echo "same Trade-W / Delta-r / p=1 / prior / kappa / TVS as 10c"
+          echo "ONLY specification switch: SV TRUE -> FALSE"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install exact pinned threshtvp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="c0133f262fcf0f935805168f8b7def02b43dc6d5"
+
+          rm -rf threshtvp_src
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+          test "$(git -C threshtvp_src rev-parse HEAD)" = "${THRESHTVP_SHA}"
+
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+      - name: Run SG no-SV diagnostic MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/60_formal_bayesian_tvp_gvar.R
+
+      - name: Validate SG no-SV metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+          root <- file.path("results","formal_tvp_parts","SG",paste0("chain_",ch))
+
+          f <- list.files(
+            root,
+            pattern=paste0("^formal_tvp_SG_chain",ch,"[.]rds$"),
+            full.names=TRUE
+          )
+
+          if (length(f) != 1L) stop("Expected exactly one SG posterior RDS.")
+
+          z <- readRDS(f)
+
+          stopifnot(as.character(z$meta$country) == "SG")
+          stopifnot(as.integer(z$meta$chain) == ch)
+          stopifnot(!isTRUE(z$meta$sv_on))
+          stopifnot(isTRUE(z$meta$tvs_on))
+          stopifnot(as.character(z$meta$main_network) == "trade_2000_2012")
+          stopifnot(basename(as.character(z$meta$source_panel)) == "panel_domestic_fin3_rate_diff.csv")
+          stopifnot(abs(as.numeric(z$meta$prior_B1)-2) < 1e-12)
+          stopifnot(abs(as.numeric(z$meta$prior_B2)-1) < 1e-12)
+          stopifnot(abs(as.numeric(z$meta$kappa0)-1e-4) < 1e-12)
+
+          cat("10F SG NO-SV METADATA: PASS\n")
+          RS
+
+      - name: Upload SG no-SV posterior
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10f-sg-nosv-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/SG/chain_${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  diagnose:
+    needs: estimate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+
+    steps:
+      - name: Download SG no-SV posterior artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10f-sg-nosv-chain*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Diagnose SG no-SV convergence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/10f_sg_nosv_diagnostic
+
+          Rscript --vanilla - <<'RS'
+          if (!requireNamespace("posterior", quietly=TRUE)) stop("posterior missing")
+
+          root <- "posterior_parts"
+          out <- "results/10f_sg_nosv_diagnostic"
+          expected_draws <- as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN"))
+
+          rhat_target <- as.numeric(Sys.getenv("FIN3_RHAT_TARGET"))
+          rhat_hard <- as.numeric(Sys.getenv("FIN3_RHAT_HARD"))
+          ess_target <- as.numeric(Sys.getenv("FIN3_ESS_TARGET"))
+          ess_hard <- as.numeric(Sys.getenv("FIN3_ESS_HARD"))
+
+          files <- list.files(
+            root,
+            pattern="^formal_tvp_SG_chain[1-4][.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+
+          if (length(files)!=4L) {
+            stop("Expected 4 SG posterior RDS files; found ",length(files))
+          }
+
+          idx <- do.call(rbind,lapply(files,function(f) {
+            z <- readRDS(f)
+            data.frame(
+              Country=as.character(z$meta$country),
+              Chain=as.integer(z$meta$chain),
+              Burn=as.integer(z$meta$burn),
+              Keep=as.integer(z$meta$keep_internal),
+              Stored=as.integer(z$meta$stored_draws),
+              SV=isTRUE(z$meta$sv_on),
+              TVS=isTRUE(z$meta$tvs_on),
+              Kappa0=as.numeric(z$meta$kappa0),
+              File=f,
+              stringsAsFactors=FALSE
+            )
+          }))
+
+          idx <- idx[order(idx$Chain),]
+
+          if (!identical(idx$Chain,1:4)) stop("SG chain grid mismatch.")
+          if (any(idx$Country!="SG")) stop("Unexpected country.")
+          if (any(idx$Stored!=expected_draws)) stop("Stored draw mismatch.")
+          if (any(idx$SV) || !all(idx$TVS)) stop("SV/TVS contract mismatch.")
+          if (any(abs(idx$Kappa0-1e-4)>1e-12)) stop("kappa mismatch.")
+
+          write.csv(idx,file.path(out,"00_parts_index.csv"),row.names=FALSE)
+
+          chains <- lapply(1:4,function(ch) {
+            z <- readRDS(idx$File[idx$Chain==ch])
+            m <- as.matrix(z$monitor)
+            if (nrow(m)!=expected_draws) stop("Monitor draw mismatch.")
+            m
+          })
+
+          pars <- colnames(chains[[1]])
+
+          if (!all(vapply(chains,function(x) identical(colnames(x),pars),logical(1)))) {
+            stop("Monitor columns differ across chains.")
+          }
+
+          rows <- list()
+          chain_rows <- list()
+          rr <- 0L
+          cr <- 0L
+
+          for (j in seq_along(pars)) {
+            mat <- do.call(cbind,lapply(chains,function(x)x[,j]))
+
+            finite <- all(is.finite(mat))
+            constant <- finite && all(apply(mat,2,sd)<1e-12)
+
+            if (finite && !constant) {
+              rh <- posterior::rhat(mat)
+              eb <- posterior::ess_bulk(mat)
+              et <- posterior::ess_tail(mat)
+            } else {
+              rh <- eb <- et <- NA_real_
+            }
+
+            rr <- rr+1L
+            rows[[rr]] <- data.frame(
+              Parameter=pars[j],
+              Rhat=rh,
+              ESS_Bulk=eb,
+              ESS_Tail=et,
+              PassRhatTarget=is.finite(rh) && rh<=rhat_target,
+              PassRhatHard=is.finite(rh) && rh<=rhat_hard,
+              PassBulkTarget=is.finite(eb) && eb>=ess_target,
+              PassBulkHard=is.finite(eb) && eb>=ess_hard,
+              PassTailTarget=is.finite(et) && et>=ess_target,
+              PassTailHard=is.finite(et) && et>=ess_hard,
+              stringsAsFactors=FALSE
+            )
+
+            for (ch in 1:4) {
+              vals <- mat[,ch]
+              cr <- cr+1L
+              chain_rows[[cr]] <- data.frame(
+                Parameter=pars[j],
+                Chain=ch,
+                Mean=mean(vals),
+                SD=sd(vals),
+                Q05=unname(quantile(vals,.05)),
+                Q50=unname(quantile(vals,.50)),
+                Q95=unname(quantile(vals,.95)),
+                stringsAsFactors=FALSE
+              )
+            }
+          }
+
+          d <- do.call(rbind,rows)
+          cs <- do.call(rbind,chain_rows)
+
+          active <- d[
+            is.finite(d$Rhat) &
+            is.finite(d$ESS_Bulk) &
+            is.finite(d$ESS_Tail),
+          ]
+
+          hard <- active[
+            active$Rhat>rhat_hard |
+            active$ESS_Bulk<ess_hard |
+            active$ESS_Tail<ess_hard,
+          ]
+
+          summary <- data.frame(
+            Country="SG",
+            Specification="TVS_TRUE__SV_FALSE",
+            Chains=4,
+            StoredPerChain=expected_draws,
+            MaxRhat=max(active$Rhat),
+            RhatTargetShare=mean(active$Rhat<=rhat_target),
+            RhatHardShare=mean(active$Rhat<=rhat_hard),
+            MinESSBulk=min(active$ESS_Bulk),
+            MinESSTail=min(active$ESS_Tail),
+            ESSBulkTargetShare=mean(active$ESS_Bulk>=ess_target),
+            ESSTailTargetShare=mean(active$ESS_Tail>=ess_target),
+            HardFailCount=nrow(hard),
+            DiagnosticPass=(nrow(hard)==0L),
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(d,file.path(out,"01_parameter_diagnostics.csv"),row.names=FALSE)
+          write.csv(cs,file.path(out,"02_chain_parameter_summary.csv"),row.names=FALSE)
+          write.csv(hard,file.path(out,"03_hard_fail_parameters.csv"),row.names=FALSE)
+          write.csv(summary,file.path(out,"04_sg_nosv_summary.csv"),row.names=FALSE)
+
+          cat("\n===== 10F SG NO-SV SUMMARY =====\n")
+          print(summary)
+
+          cat("\n===== HARD FAIL PARAMETERS =====\n")
+          if (nrow(hard)) {
+            print(hard[,c("Parameter","Rhat","ESS_Bulk","ESS_Tail")])
+          } else {
+            cat("NONE\n")
+          }
+
+          cat("\nREFERENCE 10C SG: MaxRhat about 1.1599; MinBulkESS about 16.7.\n")
+          cat("If 10F improves sharply, this supports SV/persistence confounding.\n")
+          cat("DIAGNOSTIC ONLY: do not use this SG-only no-SV posterior for formal IRF.\n")
+          RS
+
+      - name: Upload SG no-SV diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10f-sg-nosv-diagnostic-${{ github.run_id }}
+          path: results/10f_sg_nosv_diagnostic/
+          if-no-files-found: warn
+          retention-days: 30
