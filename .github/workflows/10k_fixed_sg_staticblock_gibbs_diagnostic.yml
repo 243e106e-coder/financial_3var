@@ -1,0 +1,971 @@
+name: Financial 3var 10k-fixed SG static-block Gibbs diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Original Trade-W run containing exact validated input artifact"
+        required: true
+        default: "34056102906"
+        type: string
+      model_ref:
+        description: "Exact baseline statistical-model code SHA"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+      burn_per_chain:
+        description: "SG diagnostic burn-in"
+        required: true
+        default: "12500"
+        type: string
+      postburn_per_chain:
+        description: "SG diagnostic internal post-burn iterations"
+        required: true
+        default: "50000"
+        type: string
+      stored_per_chain:
+        description: "Strictly post-burn stored draws"
+        required: true
+        default: "2000"
+        type: string
+      sv_inner_burnin:
+        description: "Conditional SV transitions inside each outer Gibbs iteration"
+        required: true
+        default: "4"
+        type: string
+      seed_base:
+        description: "Fresh independent seed base"
+        required: true
+        default: "20266137"
+        type: string
+      max_parallel:
+        description: "Maximum simultaneous SG chain jobs"
+        required: true
+        default: "4"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  estimate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_COUNTRY: "SG"
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+      FIN3_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+
+    steps:
+      - name: Checkout exact baseline model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Verify model and iteration contract
+        shell: bash
+        env:
+          MODEL_REF: ${{ inputs.model_ref }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${MODEL_REF}"
+          test -f R/00_config.R
+          test -f R/60_formal_bayesian_tvp_gvar.R
+          python3 - <<'PY'
+          import os
+          b=int(os.environ["FIN3_BURN"])
+          k=int(os.environ["FIN3_KEEP"])
+          s=int(os.environ["FIN3_STORED_PER_CHAIN"])
+          inner=int(os.environ["FIN3_SV_INNER_BURNIN"])
+          if b<5000 or k<10000 or s<1000 or s>=k:
+              raise SystemExit("Invalid MCMC iteration contract")
+          if not (1<=inner<=20):
+              raise SystemExit("SV inner burn-in must be 1..20")
+          PY
+
+      - name: Download exact original Trade-W input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify data and restricted specification contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+          test "${FIN3_NETWORK}" = "trade_2000_2012"
+          test "${FIN3_COUNTRY}" = "SG"
+          test "${FIN3_SV_ON}" = "true"
+          test "${FIN3_TVS_ON}" = "true"
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4"
+          echo "10k-fixed static Gibbs block: r_star_0,de_star_0,deq_star_0"
+          echo "All other coefficients remain latent-threshold TVP; SV remains ON."
+          echo "Static coefficients are NOT represented as zero-variance Kalman states."
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Extend pinned threshtvp with static-block Gibbs sampler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf threshtvp_src
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${FIN3_THRESHTVP_BASE_SHA}"
+          test "$(git -C threshtvp_src rev-parse HEAD)" = "${FIN3_THRESHTVP_BASE_SHA}"
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          cat >> threshtvp_src/R/MCMC_function.R <<'RS'
+          
+          MCMC_tvp_staticblock <- function(
+              Y,X,nburn,nsave,
+              priorbtheta=list(B_1=2,B_2=1,kappa0=1e-07),
+              priorb0=list(a_tau=0.1,c_tau=0.01,d_tau=0.01),
+              priorsig=c(0.01,0.01),
+              priorphi=c(2,2),
+              priormu=c(0,10^2),
+              h0prior="stationary",
+              grid.length=150,
+              thrsh.pct=0.1,
+              thrsh.pct.high=1,
+              sv_on=TRUE,
+              TVS=TRUE,
+              cons.mod=FALSE,
+              nr=1,
+              thin=0.1,
+              robust=TRUE,
+              a.approx=FALSE,
+              sim.kappa=FALSE,
+              kappa.grid=seq(1e-4,0.1,10),
+              static_idx=integer(0),
+              sv_inner_burnin=0){
+          
+              if (ncol(Y)!=1L || nr!=1L)
+                stop("static-block sampler supports one equation at a time")
+              if (cons.mod || a.approx || sim.kappa)
+                stop("Unsupported option in static-block diagnostic")
+          
+              require(stochvol)
+              require(GIGrvg)
+              require(snowfall)
+          
+              class(X) <- "matrix"
+              class(Y) <- "matrix"
+          
+              T <- nrow(Y)
+              Kfull <- ncol(X)
+              static_idx <- sort(unique(as.integer(static_idx)))
+              if (!length(static_idx) ||
+                  any(static_idx<1L) ||
+                  any(static_idx>Kfull))
+                stop("Invalid static_idx")
+          
+              dynamic_idx <- setdiff(seq_len(Kfull),static_idx)
+              Kd <- length(dynamic_idx)
+              Ks <- length(static_idx)
+              if (Kd<1L) stop("No dynamic regressors remain")
+          
+              Y__ <- as.numeric(Y[,1])
+              Xfull <- as.matrix(X)
+              Xdyn <- Xfull[,dynamic_idx,drop=FALSE]
+              Xstatic <- Xfull[,static_idx,drop=FALSE]
+          
+              B_gamma1 <- priorbtheta$B_1
+              B_gamma2 <- priorbtheta$B_2
+              kappa0 <- priorbtheta$kappa0
+              a_tau <- priorb0$a_tau
+              c_tau <- priorb0$c_tau
+              d_tau <- priorb0$d_tau
+              a_sig <- priorsig[[1]]
+              b_sig <- priorsig[[2]]
+          
+              XtX <- crossprod(Xfull)
+              B.OLS.full <- solve(XtX,crossprod(Xfull,Y__))
+              sig.OLS <- as.numeric(
+                crossprod(Y__-Xfull%*%B.OLS.full)/(T-Kfull)
+              )
+              V.OLS.full <- sig.OLS*solve(XtX)
+              sd.OLS.full <- sqrt(diag(V.OLS.full))
+          
+              if (kappa0<0) {
+                kappa0.full <- -kappa0*sd.OLS.full
+              } else {
+                kappa0.full <- rep(kappa0,Kfull)
+              }
+              kappa0.dyn <- kappa0.full[dynamic_idx]
+          
+              gamma <- as.numeric(B.OLS.full[static_idx,1])
+              sqrttheta1 <- diag(Kd)*0.1
+              sqrttheta2 <- diag(Kd)*0.01
+          
+              tau2 <- rep(4,Kfull)
+              make_vprior <- function(x){
+                if (length(x)==1L) matrix(x,1,1) else diag(x)
+              }
+              V_prior_dyn <- make_vprior(tau2[dynamic_idx])
+          
+              d_dyn <- matrix(0,Kd,1)
+              D_dyn <- matrix(1,Kd,T)
+              Omega_dyn <- matrix(1,Kd,T)
+          
+              svdraw <- list(
+                para=c(mu=-10,phi=.9,sigma=.2,latent0=-10),
+                latent=rep(-3,T)
+              )
+              hv <- svdraw$latent
+          
+              a0 <- priorphi[1]; b0 <- priorphi[2]
+              bmu <- priormu[1]; Bmu <- priormu[2]
+              Sv_priors <- specify_priors(
+                mu=sv_normal(mean=bmu,sd=Bmu),
+                phi=sv_beta(a0,b0),
+                sigma2=sv_gamma(shape=0.5,rate=1/2)
+              )
+          
+              ntot <- nburn+nsave
+              thin_out <- round(seq(nburn,ntot,length.out=thin*nsave))
+              nstore <- length(thin_out)
+          
+              H_store <- matrix(NA_real_,nstore,T)
+              A_store <- array(NA_real_,c(nstore,T,Kfull))
+              V0_store <- matrix(NA_real_,nstore,Kfull)
+              svparms_store <- matrix(NA_real_,nstore,3)
+              D_store <- array(0,c(nstore,Kfull,T))
+              thresholds_store <- matrix(0,nstore,Kfull)
+              Omega_store <- array(0,c(nstore,Kfull,T))
+              omega_store <- matrix(0,nstore,Kfull)
+              sigma2_store <- matrix(NA_real_,nstore,1)
+              thrshprior_store <- matrix(0,nstore,Kfull)
+              kappa_store <- matrix(0,nstore,1)
+          
+              ALPHA <- matrix(0,Kd,T)
+              ithin <- 0L
+              pb <- txtProgressBar(min=0,max=ntot,style=3)
+          
+              for (irep in seq_len(ntot)) {
+                Omega_dyn <- D_dyn*diag(sqrttheta1) +
+                  (1-D_dyn)*diag(sqrttheta2)
+          
+                y_dynamic <- Y__ - as.numeric(Xstatic%*%gamma)
+          
+                ALPHA1 <- try(
+                  KF_fast(
+          t(as.matrix(y_dynamic)),
+          Xdyn,
+          as.matrix(exp(hv)),
+          t(Omega_dyn),
+          Kd,1,T,
+          matrix(0,Kd,1),
+          V_prior_dyn
+                  ),
+                  silent=TRUE
+                )
+                if (inherits(ALPHA1,"try-error")) {
+                  ALPHA1 <- KF(
+          t(as.matrix(y_dynamic)),
+          Xdyn,
+          as.matrix(exp(hv)),
+          t(Omega_dyn),
+          Kd,1,T,
+          matrix(0,Kd,1),
+          V_prior_dyn
+                  )
+                }
+                ALPHA <- ALPHA1$bdraw
+                if (any(!is.finite(ALPHA)) || any(abs(ALPHA)>1e10))
+                  stop("Non-finite or explosive dynamic state draw")
+          
+                # Static Gaussian Gibbs block conditional on dynamic states and SV.
+                dyn_fit <- rowSums(Xdyn*t(ALPHA))
+                r_gamma <- Y__-dyn_fit
+                inv_var <- exp(-as.numeric(hv))
+                WX <- Xstatic*sqrt(inv_var)
+          
+                Pgamma <- crossprod(WX) +
+                  diag(1/pmax(tau2[static_idx],1e-14),Ks)
+                rhs <- crossprod(Xstatic,inv_var*r_gamma)
+                Rprec <- chol(Pgamma)
+                gamma_mean <- backsolve(
+                  Rprec,
+                  forwardsolve(t(Rprec),rhs)
+                )
+                gamma <- as.numeric(
+                  gamma_mean + backsolve(Rprec,rnorm(Ks))
+                )
+          
+                Em <- diff(t(ALPHA))
+                for (jj in seq_len(Kd)) {
+                  if (TVS) {
+          si <- (abs(Em[,jj])>d_dyn[jj,1])*1
+                  } else {
+          si <- rep(1,nrow(Em))
+                  }
+                  Em1 <- Em[si==1,jj]
+                  s1 <- B_gamma1+sum(si)/2+1/2
+                  s2 <- B_gamma2+sum(Em1^2)/2
+                  sqrttheta1[jj,jj] <- 1/rgamma(1,s1,s2)
+                  sqrttheta2[jj,jj] <- kappa0.dyn[jj]^2
+                }
+          
+                # Same shared Normal-Gamma hierarchy for dynamic initial states
+                # and the static coefficients.
+                lambda2_tau <- rgamma(
+                  1,
+                  c_tau+a_tau*Kfull,
+                  d_tau+a_tau/2*sum(tau2)
+                )
+                theta0 <- numeric(Kfull)
+                theta0[dynamic_idx] <- ALPHA[,1]
+                theta0[static_idx] <- gamma
+          
+                for (nn in seq_len(Kfull)) {
+                  td <- try(
+          rgig(
+            n=1,
+            lambda=a_tau-0.5,
+            theta0[nn]^2,
+            a_tau*lambda2_tau
+          ),
+          silent=TRUE
+                  )
+                  if (!inherits(td,"try-error") &&
+            is.finite(td) &&
+            td>0)
+          tau2[nn] <- td
+                }
+                V_prior_dyn <- make_vprior(tau2[dynamic_idx])
+          
+                if (TVS) {
+                  Achg <- t(diff(t(ALPHA)))
+                  Achg <- cbind(matrix(0,Kd,1),Achg)
+                  grid.mat <- matrix(
+          unlist(lapply(seq_len(Kd),function(jj){
+            get_grid(
+              Achg[jj,],
+              sqrt(sqrttheta1[jj,jj]),
+              grid.length=grid.length,
+              thrsh.pct=thrsh.pct,
+              thrsh.pct.high=thrsh.pct.high
+            )
+          })),
+          ncol=Kd
+                  )
+                  probs <- get_threshold(
+          Achg,sqrttheta1,sqrttheta2,grid.mat,Achg
+                  )
+                  for (jj in seq_len(Kd)) {
+          lp <- probs[,jj]
+          pr <- exp(lp-max(lp))
+          pr <- pr/sum(pr)
+          d_dyn[jj,] <- sample(grid.mat[,jj],1,prob=pr)
+          D_dyn[jj,] <- (abs(Achg[jj,])>d_dyn[jj,])*1
+                  }
+                }
+          
+                dyn_fit <- rowSums(Xdyn*t(ALPHA))
+                u_ <- Y__-dyn_fit-as.numeric(Xstatic%*%gamma)
+                u_[abs(u_)<1e-7] <- 1e-7
+          
+                if (sv_on) {
+                  para <- as.list(svdraw$para)
+                  names(para) <- c("mu","phi","sigma","latent0")
+                  para$nu <- Inf; para$rho <- 0; para$beta <- 0
+                  temp <- svsample_fast_cpp(
+          y=matrix(u_,ncol=1),
+          draws=1,
+          burnin=as.integer(sv_inner_burnin),
+          designmatrix=matrix(NA_real_),
+          priorspec=Sv_priors,
+          thinpara=1,
+          thinlatent=1,
+          keeptime="all",
+          startpara=para,
+          startlatent=svdraw$latent,
+          keeptau=FALSE,
+          print_settings=list(
+            quiet=TRUE,n_chains=1,chain=1
+          ),
+          correct_model_misspecification=FALSE,
+          interweave=TRUE,
+          myoffset=0,
+          fast_sv=default_fast_sv
+                  )
+                  hv <- temp$latent[1,]
+                  svdraw$para <- c(
+          temp$para[1,c("mu","phi","sigma")],
+          temp$latent0[1,"h_0"]
+                  )
+                  names(svdraw$para)[4] <- "latent0"
+                  svdraw$latent <- as.numeric(temp$latent)
+                  sig_eta <- 0
+                } else {
+                  S1 <- a_sig+T/2
+                  S2 <- b_sig+crossprod(u_)/2
+                  sig_eta <- 1/rgamma(1,S1,S2)
+                  hv <- rep(log(sig_eta),T)
+                }
+          
+                if (irep %in% thin_out) {
+                  ithin <- ithin+1L
+                  Afull <- matrix(NA_real_,T,Kfull)
+                  Afull[,dynamic_idx] <- t(ALPHA)
+                  Afull[,static_idx] <- matrix(
+          rep(gamma,each=T),T,Ks
+                  )
+                  Dfull <- matrix(0,Kfull,T)
+                  Dfull[dynamic_idx,] <- D_dyn
+                  dfull <- numeric(Kfull)
+                  dfull[dynamic_idx] <- as.numeric(d_dyn)
+                  ofull <- numeric(Kfull)
+                  ofull[dynamic_idx] <- diag(sqrttheta1)
+                  Omegafull <- matrix(0,Kfull,T)
+                  Omegafull[dynamic_idx,] <- Omega_dyn
+          
+                  H_store[ithin,] <- hv
+                  A_store[ithin,,] <- Afull
+                  V0_store[ithin,] <- tau2
+                  svparms_store[ithin,] <-
+          svdraw$para[c("mu","phi","sigma")]
+                  D_store[ithin,,] <- Dfull
+                  thresholds_store[ithin,] <- dfull
+                  omega_store[ithin,] <- ofull
+                  Omega_store[ithin,,] <- Omegafull
+                  sigma2_store[ithin,] <- sig_eta
+                }
+                setTxtProgressBar(pb,irep)
+              }
+          
+              dimnames(A_store)[[3]] <- colnames(Xfull)
+              return(list(
+                A=A_store,
+                V0=V0_store,
+                D_dyn=D_store,
+                H=H_store,
+                svparms=svparms_store,
+                threshold.prior=thrshprior_store,
+                Omega=Omega_store,
+                sigma2=sigma2_store,
+                omega=omega_store,
+                thresholds=thresholds_store,
+                slct=NULL,
+                X=Xfull,
+                Y=Y,
+                sd.OLS=sd.OLS.full,
+                kappa=kappa_store,
+                static_idx=static_idx,
+                dynamic_idx=dynamic_idx
+              ))
+          }
+          RS
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("threshtvp_src/R/tvp_estimate.R")
+          s=p.read_text()
+          old='cons.mod=FALSE,p=NULL,thin=0.1,CPU=4,approx=FALSE, sim.kappa0=FALSE,kappa0.grid = seq(1e-4, 0.1, 10)){'
+          new='cons.mod=FALSE,static_idx=integer(0),sv_inner_burnin=0,p=NULL,thin=0.1,CPU=4,approx=FALSE, sim.kappa0=FALSE,kappa0.grid = seq(1e-4, 0.1, 10)){'
+          if s.count(old)!=1:
+              raise SystemExit("estimate_tvp signature mismatch")
+          s=s.replace(old,new,1)
+          old='''    }else{
+                  post_draws <- MCMC_tvp(Y,X,burn,save,priorbtheta=priorbtheta,priorb0=priorb0,priorsig=priorsig,
+                  priorphi=priorphi,priormu=priormu,h0prior=h0prior,grid.length=grid.length,thrsh.pct=thrsh.pct,thrsh.pct.high=thrsh.pct.high,sv_on=sv_on,TVS=TVS,cons.mod=cons.mod,nr=1,thin=thin, a.approx=approx, sim.kappa=sim.kappa0,kappa.grid=kappa0.grid)
+                  get_var_post <- NULL
+              }
+          '''
+          new='''    }else{
+                  if (length(static_idx)>0L) {
+            post_draws <- MCMC_tvp_staticblock(
+              Y,X,burn,save,
+              priorbtheta=priorbtheta,
+              priorb0=priorb0,
+              priorsig=priorsig,
+              priorphi=priorphi,
+              priormu=priormu,
+              h0prior=h0prior,
+              grid.length=grid.length,
+              thrsh.pct=thrsh.pct,
+              thrsh.pct.high=thrsh.pct.high,
+              sv_on=sv_on,
+              TVS=TVS,
+              cons.mod=cons.mod,
+              nr=1,
+              thin=thin,
+              a.approx=approx,
+              sim.kappa=sim.kappa0,
+              kappa.grid=kappa0.grid,
+              static_idx=static_idx,
+              sv_inner_burnin=sv_inner_burnin
+            )
+                  } else {
+            post_draws <- MCMC_tvp(
+              Y,X,burn,save,
+              priorbtheta=priorbtheta,
+              priorb0=priorb0,
+              priorsig=priorsig,
+              priorphi=priorphi,
+              priormu=priormu,
+              h0prior=h0prior,
+              grid.length=grid.length,
+              thrsh.pct=thrsh.pct,
+              thrsh.pct.high=thrsh.pct.high,
+              sv_on=sv_on,
+              TVS=TVS,
+              cons.mod=cons.mod,
+              nr=1,
+              thin=thin,
+              a.approx=approx,
+              sim.kappa=sim.kappa0,
+              kappa.grid=kappa0.grid
+            )
+                  }
+                  get_var_post <- NULL
+              }
+          '''
+          if s.count(old)!=1:
+              raise SystemExit("estimate_tvp one-equation branch mismatch")
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+
+          Rscript --vanilla - <<'RS'
+          parse(file="threshtvp_src/R/MCMC_function.R")
+          parse(file="threshtvp_src/R/tvp_estimate.R")
+          cat("Modified package R parse: PASS\n")
+          RS
+
+          git -C threshtvp_src diff -- R/MCMC_function.R R/tvp_estimate.R \
+            > 10k_fixed_threshtvp_staticblock.patch
+          test -s 10k_fixed_threshtvp_staticblock.patch
+
+          R CMD INSTALL --preclean --clean --no-multiarch \
+            --with-keep.source threshtvp_src
+
+          Rscript --vanilla - <<'RS'
+          stopifnot(requireNamespace("threshtvp",quietly=TRUE))
+          stopifnot(is.function(
+            getFromNamespace("MCMC_tvp_staticblock","threshtvp")
+          ))
+          cat("Static-block sampler install: PASS\n")
+          RS
+
+      - name: Build 10k-fixed estimator from baseline R/60
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path("R/60_formal_bayesian_tvp_gvar.R")
+          dst=Path("R/60_10k_fixed_staticblock_foreign0.R")
+          s=src.read_text()
+          
+          marker="# =============================================================================\n# 2. Event-anchor table\n# =============================================================================\n"
+          insert='''# =============================================================================
+          # 10k-fixed static contemporaneous foreign block
+          # =============================================================================
+          STATIC_TERMS <- paste0(VARS, "_star_0")
+          STATIC_IDX <- match(STATIC_TERMS, TERMS)
+          if (any(is.na(STATIC_IDX))) stopf("Missing 10k-fixed static terms.")
+          if (!identical(
+            STATIC_TERMS,
+            c("r_star_0","de_star_0","deq_star_0")
+          )) stopf("Unexpected 10k-fixed static-term contract.")
+          msg(
+            "10k-fixed static terms: %s",
+            paste(STATIC_TERMS,collapse=", ")
+          )
+          
+          '''
+          if s.count(marker)!=1:
+              raise SystemExit("section marker mismatch")
+          s=s.replace(marker,insert+marker,1)
+          
+          old='''    cons.mod = FALSE,
+              p = 1,
+          '''
+          new='''    cons.mod = FALSE,
+              static_idx = STATIC_IDX,
+              sv_inner_burnin = as.integer(Sys.getenv("FIN3_SV_INNER_BURNIN")),
+              p = 1,
+          '''
+          if s.count(old)!=1:
+              raise SystemExit("estimate call mismatch")
+          s=s.replace(old,new,1)
+          
+          old='''    SV = SV_ON,
+              TVS = TVS_ON,
+              stringsAsFactors = FALSE
+          '''
+          new='''    SV = SV_ON,
+              TVS = TVS_ON,
+              StaticContemporaneousForeignBlock = TRUE,
+              stringsAsFactors = FALSE
+          '''
+          if s.count(old)!=1:
+              raise SystemExit("equation summary mismatch")
+          s=s.replace(old,new,1)
+          
+          old='''    sv_on = SV_ON,
+              tvs_on = TVS_ON,
+              prior_B1 = PRIOR_B1,
+          '''
+          new='''    sv_on = SV_ON,
+              tvs_on = TVS_ON,
+              restriction_id = "STATIC_BLOCK_ALL_CONTEMPORANEOUS_FOREIGN_STAR",
+              static_terms = STATIC_TERMS,
+              static_idx = STATIC_IDX,
+              threshtvp_base_sha = Sys.getenv("FIN3_THRESHTVP_BASE_SHA"),
+              sv_inner_burnin = as.integer(Sys.getenv("FIN3_SV_INNER_BURNIN")),
+              prior_B1 = PRIOR_B1,
+          '''
+          if s.count(old)!=1:
+              raise SystemExit("metadata mismatch")
+          s=s.replace(old,new,1)
+          
+          dst.write_text(s)
+          PY
+
+          Rscript --vanilla - <<'RS'
+          parse(file="R/60_10k_fixed_staticblock_foreign0.R")
+          cat("Estimator R parse: PASS\n")
+          RS
+
+          diff -u R/60_formal_bayesian_tvp_gvar.R \
+            R/60_10k_fixed_staticblock_foreign0.R \
+            > 10k_fixed_estimator.patch || true
+          test -s 10k_fixed_estimator.patch
+
+      - name: Run 10k-fixed SG MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/60_10k_fixed_staticblock_foreign0.R
+
+      - name: Validate static-block posterior contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla - <<'RS'
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+          root <- file.path(
+            "results","formal_tvp_parts","SG",paste0("chain_",ch)
+          )
+          f <- list.files(
+            root,
+            pattern=paste0("^formal_tvp_SG_chain",ch,"[.]rds$"),
+            full.names=TRUE
+          )
+          if (length(f)!=1L) stop("Expected one posterior RDS")
+          z <- readRDS(f)
+          st <- c("r_star_0","de_star_0","deq_star_0")
+          
+          stopifnot(isTRUE(z$meta$sv_on))
+          stopifnot(isTRUE(z$meta$tvs_on))
+          stopifnot(
+            z$meta$restriction_id ==
+              "STATIC_BLOCK_ALL_CONTEMPORANEOUS_FOREIGN_STAR"
+          )
+          stopifnot(identical(as.character(z$meta$static_terms),st))
+          
+          for (eq in z$meta$variables) {
+            for (nm in st) {
+              p <- as.numeric(z$tv_probability[,nm,eq])
+              if (max(abs(p))>1e-14)
+                stop("Static term has nonzero TV probability")
+              base <- as.numeric(z$event_coef[,1,eq,nm])
+              for (a in seq_len(dim(z$event_coef)[2])) {
+                if (max(abs(
+                  as.numeric(z$event_coef[,a,eq,nm])-base
+                ))>1e-8)
+                  stop("Static coefficient differs by anchor")
+              }
+            }
+          }
+          
+          file.copy(
+            "10k_fixed_threshtvp_staticblock.patch",
+            file.path(root,"10k_fixed_threshtvp_staticblock.patch"),
+            overwrite=TRUE
+          )
+          file.copy(
+            "10k_fixed_estimator.patch",
+            file.path(root,"10k_fixed_estimator.patch"),
+            overwrite=TRUE
+          )
+          file.copy(
+            "R/60_10k_fixed_staticblock_foreign0.R",
+            file.path(root,"60_10k_fixed_staticblock_foreign0.R"),
+            overwrite=TRUE
+          )
+          cat("10k-fixed posterior contract: PASS\n")
+          RS
+
+      - name: Upload 10k-fixed posterior
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10k-fixed-sg-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/SG/chain_${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  diagnose:
+    needs: estimate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+
+    steps:
+      - name: Download four 10k-fixed posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10k-fixed-sg-chain*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install posterior diagnostics
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Diagnose four-chain convergence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/10k_fixed_sg_diagnostic
+          Rscript --vanilla - <<'RS'
+          if (!requireNamespace("posterior",quietly=TRUE))
+            stop("posterior missing")
+          
+          root <- "posterior_parts"
+          out <- "results/10k_fixed_sg_diagnostic"
+          nd <- as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN"))
+          rt <- as.numeric(Sys.getenv("FIN3_RHAT_TARGET"))
+          rh <- as.numeric(Sys.getenv("FIN3_RHAT_HARD"))
+          et <- as.numeric(Sys.getenv("FIN3_ESS_TARGET"))
+          eh <- as.numeric(Sys.getenv("FIN3_ESS_HARD"))
+          st <- c("r_star_0","de_star_0","deq_star_0")
+          eqs <- c("r","de","deq")
+          
+          files <- list.files(
+            root,
+            pattern="^formal_tvp_SG_chain[1-4][.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+          if (length(files)!=4L) stop("Expected four posterior files")
+          
+          idx <- do.call(rbind,lapply(files,function(f){
+            z <- readRDS(f)
+            data.frame(
+              Chain=as.integer(z$meta$chain),
+              Stored=as.integer(z$meta$stored_draws),
+              Restriction=as.character(z$meta$restriction_id),
+              File=f,
+              stringsAsFactors=FALSE
+            )
+          }))
+          idx <- idx[order(idx$Chain),]
+          if (!identical(idx$Chain,1:4)) stop("Chain grid mismatch")
+          if (any(idx$Stored!=nd)) stop("Stored draw mismatch")
+          if (any(idx$Restriction !=
+                  "STATIC_BLOCK_ALL_CONTEMPORANEOUS_FOREIGN_STAR"))
+            stop("Restriction mismatch")
+          write.csv(idx,file.path(out,"00_parts_index.csv"),row.names=FALSE)
+          
+          chains <- lapply(1:4,function(ch){
+            z <- readRDS(idx$File[idx$Chain==ch])
+            m <- as.data.frame(as.matrix(z$monitor),check.names=FALSE)
+            for (eq in eqs) {
+              for (nm in st) {
+                m[[paste0(eq,"__static_coef__",nm)]] <-
+                  as.numeric(z$event_coef[,1,eq,nm])
+              }
+            }
+            as.matrix(m)
+          })
+          
+          pars <- colnames(chains[[1]])
+          if (!all(vapply(
+            chains,function(x) identical(colnames(x),pars),logical(1)
+          ))) stop("Monitor columns differ")
+          
+          rows <- list(); cr <- list(); k <- 0L; kc <- 0L
+          metric <- function(fun,x,bad){
+            y <- try(fun(x),silent=TRUE)
+            if (inherits(y,"try-error") || length(y)!=1L || !is.finite(y))
+              return(bad)
+            as.numeric(y)
+          }
+          
+          for (j in seq_along(pars)) {
+            mat <- do.call(cbind,lapply(chains,function(x)x[,j]))
+            finite <- all(is.finite(mat))
+            const <- finite && max(mat)-min(mat)<1e-12
+            active <- finite && !const
+            if (active) {
+              r <- metric(posterior::rhat,mat,Inf)
+              b <- metric(posterior::ess_bulk,mat,0)
+              t <- metric(posterior::ess_tail,mat,0)
+            } else r <- b <- t <- NA_real_
+          
+            k <- k+1L
+            rows[[k]] <- data.frame(
+              Parameter=pars[j],
+              Active=active,
+              Rhat=r,
+              ESS_Bulk=b,
+              ESS_Tail=t,
+              stringsAsFactors=FALSE
+            )
+          
+            for (ch in 1:4) {
+              v <- mat[,ch]
+              kc <- kc+1L
+              cr[[kc]] <- data.frame(
+                Parameter=pars[j],
+                Chain=ch,
+                Mean=mean(v),
+                SD=sd(v),
+                Q05=unname(quantile(v,.05)),
+                Q50=unname(quantile(v,.50)),
+                Q95=unname(quantile(v,.95)),
+                stringsAsFactors=FALSE
+              )
+            }
+          }
+          
+          d <- do.call(rbind,rows)
+          cs <- do.call(rbind,cr)
+          a <- d[d$Active,]
+          hard <- a[
+            a$Rhat>rh | a$ESS_Bulk<eh | a$ESS_Tail<eh,
+          ]
+          staticd <- a[
+            grepl("__static_coef__",a$Parameter,fixed=TRUE),
+          ]
+          if (nrow(staticd)!=9L)
+            stop("Expected nine static coefficient diagnostics")
+          
+          diagnostic_pass <- (
+            nrow(hard)==0L &&
+            mean(a$Rhat<=rt)>=.95 &&
+            mean(a$ESS_Bulk>=et)>=.90 &&
+            mean(a$ESS_Tail>=et)>=.90
+          )
+          
+          summary <- data.frame(
+            Country="SG",
+            Specification="STATIC_BLOCK_FOREIGN0__TVS_TRUE__SV_TRUE",
+            Chains=4,
+            ActiveDiagnostics=nrow(a),
+            MaxRhat=max(a$Rhat),
+            RhatTargetShare=mean(a$Rhat<=rt),
+            RhatHardShare=mean(a$Rhat<=rh),
+            MinESSBulk=min(a$ESS_Bulk),
+            MinESSTail=min(a$ESS_Tail),
+            ESSBulkTargetShare=mean(a$ESS_Bulk>=et),
+            ESSTailTargetShare=mean(a$ESS_Tail>=et),
+            HardFailCount=nrow(hard),
+            StaticCoefficientHardFailCount=sum(
+              staticd$Rhat>rh |
+              staticd$ESS_Bulk<eh |
+              staticd$ESS_Tail<eh
+            ),
+            DiagnosticPass=diagnostic_pass,
+            FormalIRFAuthorized=FALSE,
+            stringsAsFactors=FALSE
+          )
+          
+          write.csv(d,file.path(out,"01_parameter_diagnostics.csv"),row.names=FALSE)
+          write.csv(cs,file.path(out,"02_chain_parameter_summary.csv"),row.names=FALSE)
+          write.csv(staticd,file.path(out,"03_static_coefficient_diagnostics.csv"),row.names=FALSE)
+          write.csv(hard,file.path(out,"04_hard_fail_parameters.csv"),row.names=FALSE)
+          write.csv(summary,file.path(out,"05_sg_summary.csv"),row.names=FALSE)
+          
+          cat("\n===== 10K-FIXED SUMMARY =====\n")
+          print(summary)
+          cat("\n===== STATIC COEFFICIENTS =====\n")
+          print(staticd[,c("Parameter","Rhat","ESS_Bulk","ESS_Tail")])
+          cat("\n===== HARD FAILS =====\n")
+          if (nrow(hard)) {
+            print(hard[,c("Parameter","Rhat","ESS_Bulk","ESS_Tail")])
+          } else cat("NONE\n")
+          
+          if (!diagnostic_pass) {
+            stop(
+              "10k-fixed SG diagnostic failed. ",
+              "Do NOT run IRF and do NOT loosen thresholds."
+            )
+          }
+          
+          cat(
+            "\n10k-fixed SG diagnostic PASS.\n",
+            "Next step: NEW 14-country x 4-chain uniform validation.\n",
+            "Formal IRF remains unauthorized.\n",
+            sep=""
+          )
+          RS
+
+      - name: Upload 10k-fixed diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10k-fixed-sg-diagnostic-${{ github.run_id }}
+          path: results/10k_fixed_sg_diagnostic/
+          if-no-files-found: warn
+          retention-days: 30
