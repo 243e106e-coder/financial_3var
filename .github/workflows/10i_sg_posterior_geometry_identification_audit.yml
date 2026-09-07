@@ -1,0 +1,1158 @@
+name: Financial 3var 10i SG posterior-geometry identification audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Completed 10h run containing all 12 SG posterior chain artifacts"
+        required: true
+        default: "34080566179"
+        type: string
+      expected_model_ref:
+        description: "Statistical-model SHA recorded by 10h chain audits"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+      cluster_seed:
+        description: "Deterministic seed used only for k-means chain-region labeling"
+        required: true
+        default: "20261009"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify_source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+    steps:
+      - name: Verify completed 10h source run and artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
+
+          status="$(jq -r '.status' <<<"${run_json}")"
+          conclusion="$(jq -r '.conclusion' <<<"${run_json}")"
+          path="$(jq -r '.path' <<<"${run_json}")"
+
+          test "${status}" = "completed" || {
+            echo "::error::10h source run is not completed."
+            exit 1
+          }
+
+          test "${path}" = ".github/workflows/10h_sg_sv_initialization_robustness_diagnostic.yml" || {
+            echo "::error::Unexpected source workflow path: ${path}"
+            exit 1
+          }
+
+          artifacts_json="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100"
+          )"
+
+          chain_count="$(
+            jq \
+              --arg run "${SOURCE_RUN_ID}" \
+              '[.artifacts[]
+                | select(.expired == false)
+                | select(
+                    .name
+                    | test(
+                        "^financial-3var-10h-sg-svinit-(legacy|ols_centered|diffuse)-chain[1-4]-"
+                        + $run
+                        + "$"
+                      )
+                  )
+               ] | length' \
+              <<<"${artifacts_json}"
+          )"
+
+          diag_count="$(
+            jq \
+              --arg run "${SOURCE_RUN_ID}" \
+              '[.artifacts[]
+                | select(.expired == false)
+                | select(.name == ("financial-3var-10h-sg-svinit-diagnostic-" + $run))
+               ] | length' \
+              <<<"${artifacts_json}"
+          )"
+
+          test "${chain_count}" = "12" || {
+            echo "::error::Expected 12 non-expired 10h chain artifacts; found ${chain_count}."
+            exit 1
+          }
+
+          test "${diag_count}" = "1" || {
+            echo "::error::Expected exactly one 10h diagnostic artifact; found ${diag_count}."
+            exit 1
+          }
+
+          echo "10H SOURCE INTEGRITY: PASS"
+          echo "source_run_id=${SOURCE_RUN_ID}"
+          echo "source_conclusion=${conclusion}"
+          echo "chain_artifacts=${chain_count}"
+          echo "diagnostic_artifacts=${diag_count}"
+          echo "NOTE: a 10h conclusion of failure is expected when its convergence gate fails."
+
+  geometry_audit:
+    needs: verify_source
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      EXPECTED_MODEL_REF: ${{ inputs.expected_model_ref }}
+      CLUSTER_SEED: ${{ inputs.cluster_seed }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+
+    steps:
+      - name: Download all 12 10h SG posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10h-sg-svinit-*-chain*-${{ inputs.source_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install diagnostic dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Run posterior-geometry and mode-contamination audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          if (!requireNamespace("posterior", quietly=TRUE)) {
+            stop("posterior package is required.")
+          }
+
+          root <- "posterior_parts"
+          out <- file.path("results", "10i_sg_posterior_geometry_audit")
+          dir.create(out, recursive=TRUE, showWarnings=FALSE)
+
+          expected_model_ref <- Sys.getenv("EXPECTED_MODEL_REF")
+          cluster_seed <- as.integer(Sys.getenv("CLUSTER_SEED"))
+
+          rhat_target <- as.numeric(Sys.getenv("FIN3_RHAT_TARGET"))
+          rhat_hard <- as.numeric(Sys.getenv("FIN3_RHAT_HARD"))
+          ess_target <- as.numeric(Sys.getenv("FIN3_ESS_TARGET"))
+          ess_hard <- as.numeric(Sys.getenv("FIN3_ESS_HARD"))
+
+          expected_modes <- c("legacy", "ols_centered", "diffuse")
+          focal_events <- c(
+            "r__coef__2008Q3__r_L1",
+            "r__coef__2020Q1__r_L1",
+            "r__coef__2024Q2__r_L1"
+          )
+
+          ridge_parameters <- c(
+            "r__sv_mu",
+            "r__sv_phi",
+            "r__sv_sigma",
+            "r__V0__r_L1",
+            "r__omega__r_L1",
+            "r__threshold__r_L1"
+          )
+
+          as_bool <- function(x) {
+            if (is.logical(x)) return(x)
+            tolower(trimws(as.character(x))) %in% c("true", "t", "1", "yes")
+          }
+
+          safe_cor <- function(x, y, method="pearson") {
+            ok <- is.finite(x) & is.finite(y)
+            if (sum(ok) < 3L) return(NA_real_)
+            if (stats::sd(x[ok]) < 1e-14 || stats::sd(y[ok]) < 1e-14) {
+              return(NA_real_)
+            }
+            suppressWarnings(stats::cor(x[ok], y[ok], method=method))
+          }
+
+          safe_rhat <- function(mat) {
+            tryCatch(posterior::rhat(mat), error=function(e) NA_real_)
+          }
+          safe_ess_bulk <- function(mat) {
+            tryCatch(posterior::ess_bulk(mat), error=function(e) NA_real_)
+          }
+          safe_ess_tail <- function(mat) {
+            tryCatch(posterior::ess_tail(mat), error=function(e) NA_real_)
+          }
+
+          rds_files <- list.files(
+            root,
+            pattern="^formal_tvp_SG_chain[1-4][.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+
+          if (length(rds_files) != 12L) {
+            stop("Expected 12 SG posterior RDS files; found ", length(rds_files))
+          }
+
+          chain_objects <- vector("list", length(rds_files))
+          index_rows <- vector("list", length(rds_files))
+
+          for (ii in seq_along(rds_files)) {
+            f <- rds_files[ii]
+            d <- dirname(f)
+
+            audit_file <- file.path(d, "00_10h_sampler_initialization_audit.csv")
+            deg_file <- file.path(d, "05_chain_degeneracy_audit.csv")
+
+            if (!file.exists(audit_file)) {
+              stop("Missing 10h sampler audit beside ", f)
+            }
+            if (!file.exists(deg_file)) {
+              stop("Missing 10h degeneracy audit beside ", f)
+            }
+
+            a <- read.csv(audit_file, stringsAsFactors=FALSE, check.names=FALSE)
+            g <- read.csv(deg_file, stringsAsFactors=FALSE, check.names=FALSE)
+            z <- readRDS(f)
+            m <- as.matrix(z$monitor)
+
+            if (is.null(colnames(m)) || ncol(m) == 0L) {
+              stop("Posterior monitor matrix has no parameter names: ", f)
+            }
+            if (!all(focal_events %in% colnames(m))) {
+              stop(
+                "Missing focal SG r_L1 event coefficient(s) in ",
+                f,
+                ": ",
+                paste(setdiff(focal_events, colnames(m)), collapse=", ")
+              )
+            }
+
+            statistical_model_changed <- as_bool(a$StatisticalModelChanged[1])
+            prior_changed <- as_bool(a$PriorChanged[1])
+            gate_changed <- as_bool(a$GateChanged[1])
+
+            if (as.character(a$StatisticalModelSHA[1]) != expected_model_ref) {
+              stop(
+                "Unexpected statistical-model SHA in 10h audit: ",
+                as.character(a$StatisticalModelSHA[1])
+              )
+            }
+            if (statistical_model_changed || prior_changed || gate_changed) {
+              stop("10h audit reports a model/prior/gate change; aborting 10i.")
+            }
+            if (as.integer(g$DegenerateV0Parameters[1]) != 0L) {
+              stop("10h chain degeneracy audit failed for ", f)
+            }
+
+            stopifnot(as.character(z$meta$country) == "SG")
+            stopifnot(isTRUE(z$meta$sv_on))
+            stopifnot(isTRUE(z$meta$tvs_on))
+            stopifnot(abs(as.numeric(z$meta$prior_B1) - 2) < 1e-12)
+            stopifnot(abs(as.numeric(z$meta$prior_B2) - 1) < 1e-12)
+            stopifnot(abs(as.numeric(z$meta$kappa0) - 1e-4) < 1e-12)
+            stopifnot(
+              as.character(z$meta$main_network) == "trade_2000_2012"
+            )
+            stopifnot(
+              basename(as.character(z$meta$source_panel)) ==
+                "panel_domestic_fin3_rate_diff.csv"
+            )
+
+            mode <- as.character(a$InitMode[1])
+            chain <- as.integer(z$meta$chain)
+
+            if (!(mode %in% expected_modes)) {
+              stop("Unexpected init mode: ", mode)
+            }
+            if (!(chain %in% 1:4)) {
+              stop("Unexpected chain id: ", chain)
+            }
+
+            chain_objects[[ii]] <- list(
+              file=f,
+              mode=mode,
+              chain=chain,
+              monitor=m
+            )
+
+            index_rows[[ii]] <- data.frame(
+              File=f,
+              InitMode=mode,
+              Chain=chain,
+              Draws=nrow(m),
+              Parameters=ncol(m),
+              StatisticalModelSHA=as.character(a$StatisticalModelSHA[1]),
+              SV=isTRUE(z$meta$sv_on),
+              TVS=isTRUE(z$meta$tvs_on),
+              DegenerateV0Parameters=as.integer(g$DegenerateV0Parameters[1]),
+              stringsAsFactors=FALSE
+            )
+          }
+
+          idx <- do.call(rbind, index_rows)
+
+          expected_grid <- expand.grid(
+            InitMode=expected_modes,
+            Chain=1:4,
+            stringsAsFactors=FALSE
+          )
+
+          got_keys <- paste(idx$InitMode, idx$Chain, sep="||")
+          expected_keys <- paste(
+            expected_grid$InitMode,
+            expected_grid$Chain,
+            sep="||"
+          )
+
+          if (anyDuplicated(got_keys)) {
+            stop("Duplicate InitMode/Chain combination.")
+          }
+          if (length(setdiff(expected_keys, got_keys))) {
+            stop(
+              "Missing InitMode/Chain combination(s): ",
+              paste(setdiff(expected_keys, got_keys), collapse=", ")
+            )
+          }
+
+          ref_names <- colnames(chain_objects[[1]]$monitor)
+          ref_draws <- nrow(chain_objects[[1]]$monitor)
+
+          if (!all(vapply(
+            chain_objects,
+            function(x) identical(colnames(x$monitor), ref_names),
+            logical(1)
+          ))) {
+            stop("Monitored parameter names differ across the 12 chains.")
+          }
+
+          if (!all(vapply(
+            chain_objects,
+            function(x) nrow(x$monitor) == ref_draws,
+            logical(1)
+          ))) {
+            stop("Stored draw counts differ across the 12 chains.")
+          }
+
+          ord <- order(match(idx$InitMode, expected_modes), idx$Chain)
+          idx <- idx[ord, , drop=FALSE]
+          chain_objects <- chain_objects[ord]
+
+          write.csv(
+            idx,
+            file.path(out, "00_parts_index.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------
+          # 1. Construct one per-draw focal SG persistence index.
+          #    Because 10h showed the three event r_L1 coefficients move
+          #    almost identically, use their row-wise average.
+          # ------------------------------------------------------------
+          chain_summary_rows <- list()
+
+          for (ii in seq_along(chain_objects)) {
+            obj <- chain_objects[[ii]]
+            m <- obj$monitor
+
+            focal_draw <- rowMeans(m[, focal_events, drop=FALSE])
+
+            h <- floor(length(focal_draw) / 2)
+            first_half <- focal_draw[seq_len(h)]
+            second_half <- focal_draw[(h + 1L):length(focal_draw)]
+
+            chain_summary_rows[[ii]] <- data.frame(
+              InitMode=obj$mode,
+              Chain=obj$chain,
+              FocalR_L1_Mean=mean(focal_draw),
+              FocalR_L1_SD=stats::sd(focal_draw),
+              FocalR_L1_Q05=stats::quantile(focal_draw, .05, names=FALSE),
+              FocalR_L1_Median=stats::median(focal_draw),
+              FocalR_L1_Q95=stats::quantile(focal_draw, .95, names=FALSE),
+              FirstHalfMean=mean(first_half),
+              SecondHalfMean=mean(second_half),
+              HalfDrift=mean(second_half) - mean(first_half),
+              stringsAsFactors=FALSE
+            )
+          }
+
+          chain_summary <- do.call(rbind, chain_summary_rows)
+
+          # ------------------------------------------------------------
+          # 2. Data-driven two-region chain classification.
+          #    This labels posterior regions; it does NOT discard chains.
+          # ------------------------------------------------------------
+          set.seed(cluster_seed)
+          km <- stats::kmeans(
+            chain_summary$FocalR_L1_Mean,
+            centers=2,
+            nstart=100,
+            iter.max=100
+          )
+
+          raw_centers <- as.numeric(km$centers[,1])
+          low_cluster <- which.min(raw_centers)
+          high_cluster <- which.max(raw_centers)
+
+          chain_summary$Region <- ifelse(
+            km$cluster == low_cluster,
+            "LOW_R_L1_REGION",
+            "HIGH_R_L1_REGION"
+          )
+
+          low_center <- raw_centers[low_cluster]
+          high_center <- raw_centers[high_cluster]
+          midpoint <- mean(c(low_center, high_center))
+
+          chain_summary$FractionDrawsAboveRegionMidpoint <- NA_real_
+
+          for (ii in seq_along(chain_objects)) {
+            m <- chain_objects[[ii]]$monitor
+            focal_draw <- rowMeans(m[, focal_events, drop=FALSE])
+            chain_summary$FractionDrawsAboveRegionMidpoint[ii] <-
+              mean(focal_draw > midpoint)
+          }
+
+          chain_summary <- chain_summary[
+            order(
+              factor(chain_summary$Region,
+                     levels=c("LOW_R_L1_REGION", "HIGH_R_L1_REGION")),
+              match(chain_summary$InitMode, expected_modes),
+              chain_summary$Chain
+            ),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            chain_summary,
+            file.path(out, "01_chain_region_classification.csv"),
+            row.names=FALSE
+          )
+
+          region_summary <- aggregate(
+            cbind(
+              FocalR_L1_Mean,
+              FocalR_L1_SD,
+              HalfDrift,
+              FractionDrawsAboveRegionMidpoint
+            ) ~ Region,
+            data=chain_summary,
+            FUN=mean
+          )
+
+          region_n <- aggregate(
+            Chain ~ Region,
+            data=chain_summary,
+            FUN=length
+          )
+          names(region_n)[2] <- "Chains"
+          region_summary <- merge(
+            region_n,
+            region_summary,
+            by="Region",
+            all=TRUE,
+            sort=FALSE
+          )
+          region_summary$ClusterCenter <- ifelse(
+            region_summary$Region == "LOW_R_L1_REGION",
+            low_center,
+            high_center
+          )
+          region_summary$RegionMidpoint <- midpoint
+          region_summary$CenterGap <- high_center - low_center
+
+          write.csv(
+            region_summary,
+            file.path(out, "02_region_summary.csv"),
+            row.names=FALSE
+          )
+
+          # Reattach Region to ordered chain objects.
+          region_key <- paste(
+            chain_summary$InitMode,
+            chain_summary$Chain,
+            sep="||"
+          )
+          for (ii in seq_along(chain_objects)) {
+            key <- paste(
+              chain_objects[[ii]]$mode,
+              chain_objects[[ii]]$chain,
+              sep="||"
+            )
+            chain_objects[[ii]]$region <-
+              chain_summary$Region[match(key, region_key)]
+          }
+
+          # ------------------------------------------------------------
+          # 3. Ridge correlation audit.
+          #    Report:
+          #      a) correlation of 12 chain means;
+          #      b) distribution of within-chain correlations;
+          #      c) pooled within-chain-centered correlation.
+          # ------------------------------------------------------------
+          present_ridge <- intersect(ridge_parameters, ref_names)
+          ridge_rows <- list()
+          rr <- 0L
+
+          for (nm in present_ridge) {
+            focal_chain_means <- numeric(length(chain_objects))
+            other_chain_means <- numeric(length(chain_objects))
+            pearson_within <- numeric(length(chain_objects))
+            spearman_within <- numeric(length(chain_objects))
+            centered_focal <- numeric(0)
+            centered_other <- numeric(0)
+
+            for (ii in seq_along(chain_objects)) {
+              m <- chain_objects[[ii]]$monitor
+              focal_draw <- rowMeans(m[, focal_events, drop=FALSE])
+              other <- m[,nm]
+
+              focal_chain_means[ii] <- mean(focal_draw)
+              other_chain_means[ii] <- mean(other)
+
+              pearson_within[ii] <- safe_cor(
+                focal_draw, other, method="pearson"
+              )
+              spearman_within[ii] <- safe_cor(
+                focal_draw, other, method="spearman"
+              )
+
+              centered_focal <- c(
+                centered_focal,
+                focal_draw - mean(focal_draw)
+              )
+              centered_other <- c(
+                centered_other,
+                other - mean(other)
+              )
+            }
+
+            rr <- rr + 1L
+            ridge_rows[[rr]] <- data.frame(
+              Parameter=nm,
+              ChainMeanPearson=safe_cor(
+                focal_chain_means,
+                other_chain_means,
+                method="pearson"
+              ),
+              ChainMeanSpearman=safe_cor(
+                focal_chain_means,
+                other_chain_means,
+                method="spearman"
+              ),
+              MedianWithinChainPearson=stats::median(
+                pearson_within,
+                na.rm=TRUE
+              ),
+              MinWithinChainPearson=min(
+                pearson_within,
+                na.rm=TRUE
+              ),
+              MaxWithinChainPearson=max(
+                pearson_within,
+                na.rm=TRUE
+              ),
+              MedianWithinChainSpearman=stats::median(
+                spearman_within,
+                na.rm=TRUE
+              ),
+              PooledWithinChainCenteredPearson=safe_cor(
+                centered_focal,
+                centered_other,
+                method="pearson"
+              ),
+              stringsAsFactors=FALSE
+            )
+          }
+
+          ridge_cor <- if (length(ridge_rows)) {
+            do.call(rbind, ridge_rows)
+          } else {
+            data.frame(
+              Parameter=character(),
+              ChainMeanPearson=numeric(),
+              ChainMeanSpearman=numeric(),
+              MedianWithinChainPearson=numeric(),
+              MinWithinChainPearson=numeric(),
+              MaxWithinChainPearson=numeric(),
+              MedianWithinChainSpearman=numeric(),
+              PooledWithinChainCenteredPearson=numeric()
+            )
+          }
+
+          write.csv(
+            ridge_cor,
+            file.path(out, "03_ridge_correlations.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------
+          # 4. Recalculate convergence separately inside LOW and HIGH
+          #    regions, and also across all 12 chains.
+          # ------------------------------------------------------------
+          calc_diag <- function(objects, group_name) {
+            if (length(objects) < 2L) {
+              return(data.frame(
+                Group=group_name,
+                Parameter=ref_names,
+                Chains=length(objects),
+                DrawsPerChain=if (length(objects)) {
+                  nrow(objects[[1]]$monitor)
+                } else {
+                  NA_integer_
+                },
+                Rhat=NA_real_,
+                ESS_Bulk=NA_real_,
+                ESS_Tail=NA_real_,
+                PassRhatHard=NA,
+                PassESSBulkHard=NA,
+                PassESSTailHard=NA,
+                PassRhatTarget=NA,
+                PassESSBulkTarget=NA,
+                PassESSTailTarget=NA,
+                stringsAsFactors=FALSE
+              ))
+            }
+
+            rows <- lapply(seq_along(ref_names), function(jj) {
+              mat <- do.call(
+                cbind,
+                lapply(objects, function(x) x$monitor[,jj])
+              )
+
+              finite <- all(is.finite(mat))
+              constant <- finite &&
+                all(apply(mat, 2, stats::sd) < 1e-12)
+
+              if (!finite || constant) {
+                rh <- eb <- et <- NA_real_
+              } else {
+                rh <- safe_rhat(mat)
+                eb <- safe_ess_bulk(mat)
+                et <- safe_ess_tail(mat)
+              }
+
+              data.frame(
+                Group=group_name,
+                Parameter=ref_names[jj],
+                Chains=ncol(mat),
+                DrawsPerChain=nrow(mat),
+                Rhat=rh,
+                ESS_Bulk=eb,
+                ESS_Tail=et,
+                PassRhatHard=if (is.finite(rh)) rh <= rhat_hard else NA,
+                PassESSBulkHard=if (is.finite(eb)) eb >= ess_hard else NA,
+                PassESSTailHard=if (is.finite(et)) et >= ess_hard else NA,
+                PassRhatTarget=if (is.finite(rh)) rh <= rhat_target else NA,
+                PassESSBulkTarget=if (is.finite(eb)) eb >= ess_target else NA,
+                PassESSTailTarget=if (is.finite(et)) et >= ess_target else NA,
+                stringsAsFactors=FALSE
+              )
+            })
+
+            do.call(rbind, rows)
+          }
+
+          low_objects <- Filter(
+            function(x) identical(x$region, "LOW_R_L1_REGION"),
+            chain_objects
+          )
+          high_objects <- Filter(
+            function(x) identical(x$region, "HIGH_R_L1_REGION"),
+            chain_objects
+          )
+
+          within_region_diag <- rbind(
+            calc_diag(low_objects, "LOW_R_L1_REGION"),
+            calc_diag(high_objects, "HIGH_R_L1_REGION"),
+            calc_diag(chain_objects, "POOLED_12_CHAINS")
+          )
+
+          write.csv(
+            within_region_diag,
+            file.path(out, "04_within_region_convergence.csv"),
+            row.names=FALSE
+          )
+
+          focal_diag <- within_region_diag[
+            within_region_diag$Parameter %in% focal_events,
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            focal_diag,
+            file.path(out, "05_focal_r_l1_region_convergence.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------
+          # 5. High-vs-low region sensitivity for every monitored param.
+          #    The denominator is pooled average within-chain posterior SD.
+          #    This is descriptive geometry, NOT a hypothesis test.
+          # ------------------------------------------------------------
+          classify_parameter <- function(nm) {
+            if (nm %in% focal_events) {
+              return("FOCAL_R_L1_EVENT")
+            }
+            if (grepl("^.+__coef__.+__gpr_(0|L1)$", nm)) {
+              return("GPR_EVENT")
+            }
+            if (grepl(
+              "^.+__coef__.+__(r|de|deq)_star_(0|L1)$",
+              nm
+            )) {
+              return("FOREIGN_STAR_EVENT")
+            }
+            if (grepl("^.+__coef__.+__brent_(0|L1)$", nm)) {
+              return("BRENT_EVENT")
+            }
+            if (grepl("^r__sv_", nm)) {
+              return("R_EQUATION_SV")
+            }
+            if (grepl("^r__(V0|omega|threshold)__r_L1$", nm)) {
+              return("R_L1_VARIANCE_THRESHOLD")
+            }
+            if (grepl("^r__coef__", nm)) {
+              return("OTHER_R_EVENT")
+            }
+            if (grepl("^de__coef__", nm)) {
+              return("DE_EVENT")
+            }
+            if (grepl("^deq__coef__", nm)) {
+              return("DEQ_EVENT")
+            }
+            if (grepl("^de__", nm)) {
+              return("DE_OTHER")
+            }
+            if (grepl("^deq__", nm)) {
+              return("DEQ_OTHER")
+            }
+            if (grepl("^r__", nm)) {
+              return("R_OTHER")
+            }
+            "OTHER"
+          }
+
+          sensitivity_rows <- lapply(seq_along(ref_names), function(jj) {
+            nm <- ref_names[jj]
+
+            chain_means <- vapply(
+              chain_objects,
+              function(x) mean(x$monitor[,jj]),
+              numeric(1)
+            )
+            chain_sds <- vapply(
+              chain_objects,
+              function(x) stats::sd(x$monitor[,jj]),
+              numeric(1)
+            )
+            regions <- vapply(
+              chain_objects,
+              function(x) x$region,
+              character(1)
+            )
+
+            low <- chain_means[regions == "LOW_R_L1_REGION"]
+            high <- chain_means[regions == "HIGH_R_L1_REGION"]
+
+            low_mean <- mean(low)
+            high_mean <- mean(high)
+            diff <- high_mean - low_mean
+
+            pooled_within_sd <- sqrt(mean(chain_sds^2, na.rm=TRUE))
+            separation <- if (
+              is.finite(pooled_within_sd) &&
+              pooled_within_sd > 1e-14
+            ) {
+              diff / pooled_within_sd
+            } else {
+              NA_real_
+            }
+
+            data.frame(
+              Parameter=nm,
+              Category=classify_parameter(nm),
+              LowRegionChains=length(low),
+              HighRegionChains=length(high),
+              LowRegionMean=low_mean,
+              HighRegionMean=high_mean,
+              HighMinusLow=diff,
+              AbsHighMinusLow=abs(diff),
+              PooledAverageWithinChainSD=pooled_within_sd,
+              SeparationOverWithinSD=separation,
+              AbsSeparationOverWithinSD=abs(separation),
+              LowRegionChainMeanSD=if (length(low) > 1L) {
+                stats::sd(low)
+              } else {
+                NA_real_
+              },
+              HighRegionChainMeanSD=if (length(high) > 1L) {
+                stats::sd(high)
+              } else {
+                NA_real_
+              },
+              stringsAsFactors=FALSE
+            )
+          })
+
+          sensitivity <- do.call(rbind, sensitivity_rows)
+          sensitivity <- sensitivity[
+            order(-sensitivity$AbsSeparationOverWithinSD),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            sensitivity,
+            file.path(out, "06_parameter_region_sensitivity.csv"),
+            row.names=FALSE
+          )
+
+          write.csv(
+            head(sensitivity, 40),
+            file.path(out, "07_top40_mode_sensitive_parameters.csv"),
+            row.names=FALSE
+          )
+
+          finite_sens <- sensitivity[
+            is.finite(sensitivity$AbsSeparationOverWithinSD),
+            ,
+            drop=FALSE
+          ]
+
+          category_summary <- do.call(
+            rbind,
+            lapply(split(finite_sens, finite_sens$Category), function(x) {
+              data.frame(
+                Category=x$Category[1],
+                Parameters=nrow(x),
+                MaxAbsSeparationOverWithinSD=max(
+                  x$AbsSeparationOverWithinSD
+                ),
+                MedianAbsSeparationOverWithinSD=stats::median(
+                  x$AbsSeparationOverWithinSD
+                ),
+                MeanAbsSeparationOverWithinSD=mean(
+                  x$AbsSeparationOverWithinSD
+                ),
+                ParameterAtMaximum=x$Parameter[
+                  which.max(x$AbsSeparationOverWithinSD)
+                ],
+                stringsAsFactors=FALSE
+              )
+            })
+          )
+
+          category_summary <- category_summary[
+            order(-category_summary$MaxAbsSeparationOverWithinSD),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            category_summary,
+            file.path(out, "08_category_mode_sensitivity_summary.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------
+          # 6. Chain-by-chain means for paper-relevant transmission terms.
+          # ------------------------------------------------------------
+          paper_patterns <- c(
+            "__gpr_0$",
+            "__gpr_L1$",
+            "__r_star_0$",
+            "__r_star_L1$",
+            "__de_star_0$",
+            "__de_star_L1$",
+            "__deq_star_0$",
+            "__deq_star_L1$"
+          )
+
+          paper_params <- ref_names[
+            Reduce(
+              `|`,
+              lapply(
+                paper_patterns,
+                function(p) grepl(p, ref_names)
+              )
+            )
+          ]
+
+          paper_rows <- list()
+          kk <- 0L
+
+          for (ii in seq_along(chain_objects)) {
+            obj <- chain_objects[[ii]]
+            m <- obj$monitor
+
+            for (nm in paper_params) {
+              kk <- kk + 1L
+              x <- m[,nm]
+
+              paper_rows[[kk]] <- data.frame(
+                InitMode=obj$mode,
+                Chain=obj$chain,
+                Region=obj$region,
+                Parameter=nm,
+                Category=classify_parameter(nm),
+                Mean=mean(x),
+                SD=stats::sd(x),
+                Q05=stats::quantile(x, .05, names=FALSE),
+                Median=stats::median(x),
+                Q95=stats::quantile(x, .95, names=FALSE),
+                stringsAsFactors=FALSE
+              )
+            }
+          }
+
+          paper_summary <- if (length(paper_rows)) {
+            do.call(rbind, paper_rows)
+          } else {
+            data.frame(
+              InitMode=character(),
+              Chain=integer(),
+              Region=character(),
+              Parameter=character(),
+              Category=character(),
+              Mean=numeric(),
+              SD=numeric(),
+              Q05=numeric(),
+              Median=numeric(),
+              Q95=numeric()
+            )
+          }
+
+          write.csv(
+            paper_summary,
+            file.path(out, "09_paper_relevant_chain_parameter_summary.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------
+          # 7. Compact diagnostic decision record.
+          #    No threshold is weakened and no IRF is authorized.
+          # ------------------------------------------------------------
+          focal_pooled <- focal_diag[
+            focal_diag$Group == "POOLED_12_CHAINS",
+            ,
+            drop=FALSE
+          ]
+          focal_low <- focal_diag[
+            focal_diag$Group == "LOW_R_L1_REGION",
+            ,
+            drop=FALSE
+          ]
+          focal_high <- focal_diag[
+            focal_diag$Group == "HIGH_R_L1_REGION",
+            ,
+            drop=FALSE
+          ]
+
+          hard_pass_block <- function(x) {
+            if (!nrow(x)) return(FALSE)
+            vals <- (
+              x$PassRhatHard &
+              x$PassESSBulkHard &
+              x$PassESSTailHard
+            )
+            all(vals[!is.na(vals)])
+          }
+
+          pooled_focal_hard_pass <- hard_pass_block(focal_pooled)
+          low_focal_hard_pass <- hard_pass_block(focal_low)
+          high_focal_hard_pass <- hard_pass_block(focal_high)
+
+          region_separation_supported <- (
+            low_focal_hard_pass &&
+            high_focal_hard_pass &&
+            !pooled_focal_hard_pass
+          )
+
+          get_cat_max <- function(cat) {
+            x <- category_summary[
+              category_summary$Category == cat,
+              "MaxAbsSeparationOverWithinSD"
+            ]
+            if (!length(x)) NA_real_ else as.numeric(x[1])
+          }
+
+          decision <- data.frame(
+            Diagnostic="10i_SG_posterior_geometry_identification_audit",
+            Source10hRun=Sys.getenv("SOURCE_RUN_ID"),
+            StatisticalModelChanged=FALSE,
+            PriorChanged=FALSE,
+            GateChanged=FALSE,
+            ChainsDiscarded=FALSE,
+            ThresholdsLoosened=FALSE,
+            LowRegionChains=length(low_objects),
+            HighRegionChains=length(high_objects),
+            LowRegionCenter=low_center,
+            HighRegionCenter=high_center,
+            RegionCenterGap=high_center-low_center,
+            LowRegionFocalHardPass=low_focal_hard_pass,
+            HighRegionFocalHardPass=high_focal_hard_pass,
+            Pooled12FocalHardPass=pooled_focal_hard_pass,
+            CleanTwoRegionSeparationSupported=region_separation_supported,
+            GPRMaxAbsSeparationOverWithinSD=get_cat_max("GPR_EVENT"),
+            ForeignStarMaxAbsSeparationOverWithinSD=get_cat_max(
+              "FOREIGN_STAR_EVENT"
+            ),
+            DEEventMaxAbsSeparationOverWithinSD=get_cat_max("DE_EVENT"),
+            DEQEventMaxAbsSeparationOverWithinSD=get_cat_max("DEQ_EVENT"),
+            AuthorizationForIRF=FALSE,
+            NextAction=if (region_separation_supported) {
+              paste(
+                "The focal SG r_L1 block is internally better behaved within",
+                "two posterior regions but fails when pooled. Review whether",
+                "paper-relevant GPR/foreign-star/de/deq blocks shift materially",
+                "between regions before changing the formal specification."
+              )
+            } else {
+              paste(
+                "The two-region decomposition does not by itself isolate the",
+                "mixing failure. Inspect within-region convergence and the",
+                "ridge-correlation outputs before changing the specification."
+              )
+            },
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(
+            decision,
+            file.path(out, "10_decision.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------
+          # 8. Simple diagnostic plots for artifact inspection.
+          # ------------------------------------------------------------
+          plot_chain_means <- function(yparam, filename) {
+            if (!(yparam %in% ref_names)) return(invisible(NULL))
+
+            x <- chain_summary$FocalR_L1_Mean
+            y <- numeric(length(chain_objects))
+
+            for (ii in seq_along(chain_objects)) {
+              y[ii] <- mean(chain_objects[[ii]]$monitor[,yparam])
+            }
+
+            png(
+              file.path(out, filename),
+              width=1200,
+              height=900,
+              res=140
+            )
+            plot(
+              x,
+              y,
+              xlab="Chain mean: average SG r_L1 event coefficient",
+              ylab=paste("Chain mean:", yparam),
+              main=paste("SG posterior geometry:", yparam),
+              pch=19
+            )
+            text(
+              x,
+              y,
+              labels=paste(
+                chain_summary$InitMode,
+                chain_summary$Chain,
+                sep="-"
+              ),
+              pos=3,
+              cex=.7
+            )
+            abline(v=midpoint, lty=2)
+            dev.off()
+          }
+
+          plot_chain_means(
+            "r__sv_phi",
+            "11_chainmean_rL1_vs_sv_phi.png"
+          )
+          plot_chain_means(
+            "r__sv_sigma",
+            "12_chainmean_rL1_vs_sv_sigma.png"
+          )
+          plot_chain_means(
+            "r__V0__r_L1",
+            "13_chainmean_rL1_vs_V0_rL1.png"
+          )
+
+          top_plot <- head(
+            finite_sens[
+              order(-finite_sens$AbsSeparationOverWithinSD),
+              ,
+              drop=FALSE
+            ],
+            25
+          )
+
+          if (nrow(top_plot)) {
+            png(
+              file.path(out, "14_top25_region_sensitive_parameters.png"),
+              width=1600,
+              height=1200,
+              res=140
+            )
+            op <- par(mar=c(5, 16, 4, 2))
+            barplot(
+              rev(top_plot$AbsSeparationOverWithinSD),
+              names.arg=rev(top_plot$Parameter),
+              horiz=TRUE,
+              las=1,
+              xlab="|High-low chain-mean difference| / pooled within-chain SD",
+              main="Top 25 SG posterior-region-sensitive parameters",
+              cex.names=.65
+            )
+            par(op)
+            dev.off()
+          }
+
+          cat("\n================ 10I REGION SUMMARY ================\n")
+          print(region_summary, row.names=FALSE)
+
+          cat("\n================ 10I RIDGE CORRELATIONS =============\n")
+          print(ridge_cor, row.names=FALSE)
+
+          cat("\n================ 10I CATEGORY SENSITIVITY ============\n")
+          print(category_summary, row.names=FALSE)
+
+          cat("\n================ 10I DECISION ========================\n")
+          print(decision, row.names=FALSE)
+
+          cat(
+            "\n10I DIAGNOSTIC COMPLETE. ",
+            "No chain was discarded, no threshold was changed, ",
+            "and this workflow NEVER authorizes IRF.\n",
+            sep=""
+          )
+          RS
+
+      - name: Upload 10i posterior-geometry audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10i-sg-posterior-geometry-${{ github.run_id }}
+          path: results/10i_sg_posterior_geometry_audit/
+          if-no-files-found: error
+          retention-days: 30
