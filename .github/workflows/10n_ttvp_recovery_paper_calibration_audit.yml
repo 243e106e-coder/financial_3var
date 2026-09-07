@@ -1,4 +1,5 @@
 name: Financial 3var 10n TTVP recovery and JRSSA-2019 calibration audit
+# V2 workflow: fixed scenario parsing/current checkout; draw-bookkeeping fix lives in R/69.
 
 on:
   workflow_dispatch:
