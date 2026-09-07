@@ -87,10 +87,9 @@ jobs:
       STATICBLOCK_WORKFLOW_BLOB: "436875586a02ab3c2bfb4f90722a0ba1a4796b84"
 
     steps:
-      - name: Checkout exact tested static-block implementation
+      - name: Checkout current 10n code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.staticblock_ref }}
           fetch-depth: 0
 
       - name: Parse diagnostic scenario
@@ -100,7 +99,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          IFS='__' read -r CASE CALIB MODE <<< "${SCENARIO}"
+          # IMPORTANT: Bash IFS splits on individual characters, not on the
+          # string "__". Parse the double-underscore delimiter explicitly.
+          CASE="${SCENARIO%%__*}"
+          REST="${SCENARIO#*__}"
+
+          if [[ "${REST}" == "${SCENARIO}" ]]; then
+            echo "::error::Scenario missing first '__' delimiter: ${SCENARIO}"
+            exit 1
+          fi
+
+          CALIB="${REST%%__*}"
+          MODE="${REST#*__}"
+
+          if [[ "${MODE}" == "${REST}" ]]; then
+            echo "::error::Scenario missing second '__' delimiter: ${SCENARIO}"
+            exit 1
+          fi
+
+          REBUILT="${CASE}__${CALIB}__${MODE}"
+          if [[ "${REBUILT}" != "${SCENARIO}" ]]; then
+            echo "::error::Scenario parsing mismatch: ${SCENARIO} -> ${REBUILT}"
+            exit 1
+          fi
 
           case "${CASE}" in
             REAL_JP|REAL_SG|REAL_TR|SYNTH_JP) ;;
@@ -121,6 +142,10 @@ jobs:
             exit 1
           fi
 
+          echo "parsed CASE=${CASE}"
+          echo "parsed CALIB=${CALIB}"
+          echo "parsed MODE=${MODE}"
+
           {
             echo "FIN3_10N_CASE=${CASE}"
             echo "FIN3_10N_CALIBRATION=${CALIB}"
@@ -135,7 +160,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          test "$(git rev-parse HEAD)" = "${STATICBLOCK_REF}"
+          # Current HEAD supplies the 10n R scripts. The previously tested
+          # static-block implementation remains locked separately by its
+          # historical commit and workflow blob SHA.
+          git cat-file -e "${STATICBLOCK_REF}^{commit}" || {
+            echo "::error::Static-block provenance commit unavailable: ${STATICBLOCK_REF}"
+            exit 1
+          }
+
           test -f R/00_config.R
           test -f R/69_ttvp_recovery_chain.R
           test -f R/70_ttvp_recovery_summarize.R
