@@ -1,0 +1,1030 @@
+name: Financial 3var 10k SG static contemporaneous-foreign diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Original Trade-W run containing exact input artifact"
+        required: true
+        default: "34056102906"
+        type: string
+
+      model_ref:
+        description: "Exact baseline statistical-model code SHA"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+
+      burn_per_chain:
+        description: "SG diagnostic burn-in"
+        required: true
+        default: "12500"
+        type: string
+
+      postburn_per_chain:
+        description: "SG diagnostic internal post-burn iterations"
+        required: true
+        default: "50000"
+        type: string
+
+      stored_per_chain:
+        description: "Strictly post-burn stored draws"
+        required: true
+        default: "2000"
+        type: string
+
+      sv_inner_burnin:
+        description: "Within-outer-iteration SV burn-in; sampler-mixing patch only"
+        required: true
+        default: "4"
+        type: string
+
+      seed_base:
+        description: "Fresh independent seed base"
+        required: true
+        default: "20265911"
+        type: string
+
+      max_parallel:
+        description: "Maximum simultaneous chain jobs"
+        required: true
+        default: "4"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  estimate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_COUNTRY: "SG"
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+      FIN3_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+      FIN3_STATIC_FOREIGN0_TERMS: "r_star_0,de_star_0,deq_star_0"
+
+    steps:
+      - name: Checkout exact baseline model code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.model_ref }}
+
+      - name: Verify exact baseline model SHA
+        shell: bash
+        env:
+          MODEL_REF: ${{ inputs.model_ref }}
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "${MODEL_REF}" || {
+            echo "::error::Checked-out SHA does not equal model_ref."
+            exit 1
+          }
+
+          for f in \
+            R/00_config.R \
+            R/60_formal_bayesian_tvp_gvar.R
+          do
+            test -f "${f}" || {
+              echo "::error::Missing ${f}"
+              exit 1
+            }
+          done
+
+      - name: Download exact original Trade-W input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify 10k specification contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+
+          test "${FIN3_COUNTRY}" = "SG"
+          test "${FIN3_NETWORK}" = "trade_2000_2012"
+          test "${FIN3_SV_ON}" = "true"
+          test "${FIN3_TVS_ON}" = "true"
+          test "${FIN3_TTVP_B1}" = "2"
+          test "${FIN3_TTVP_B2}" = "1"
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4"
+          test "${FIN3_STATIC_FOREIGN0_TERMS}" = "r_star_0,de_star_0,deq_star_0"
+
+          python3 - <<'PY'
+          import os
+          x = int(os.environ["FIN3_SV_INNER_BURNIN"])
+          if x < 1 or x > 20:
+              raise SystemExit("FIN3_SV_INNER_BURNIN must be between 1 and 20.")
+          PY
+
+          echo "========================================================="
+          echo "10K SG RESTRICTED-TVP SPECIFICATION DIAGNOSTIC"
+          echo "Same Trade-W / Delta-r / p=1 / priors / SV / TVS as 10c."
+          echo "Uniform restriction under test:"
+          echo "  r_star_0, de_star_0, deq_star_0 are TIME-INVARIANT."
+          echo "All other coefficients retain latent-threshold TVP."
+          echo "SV remains ON with inner burn-in ${FIN3_SV_INNER_BURNIN}."
+          echo "DIAGNOSTIC ONLY: no formal IRF authorization in this workflow."
+          echo "========================================================="
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Patch and install pinned threshtvp for selective static coefficients
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          THRESHTVP_SHA="${FIN3_THRESHTVP_BASE_SHA}"
+
+          rm -rf threshtvp_src
+          git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+          git -C threshtvp_src checkout --detach "${THRESHTVP_SHA}"
+
+          test "$(git -C threshtvp_src rev-parse HEAD)" = "${THRESHTVP_SHA}"
+
+          find threshtvp_src/src -maxdepth 1 -type f \
+            \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -delete
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          
+          mcmc_path = Path("threshtvp_src/R/MCMC_function.R")
+          est_path = Path("threshtvp_src/R/tvp_estimate.R")
+          s = mcmc_path.read_text(encoding="utf-8")
+          est = est_path.read_text(encoding="utf-8")
+          inner = int(os.environ["FIN3_SV_INNER_BURNIN"])
+          
+          start = s.find("MCMC_tvp <- function")
+          end = s.find("VAR_posterior <- function", start)
+          if start < 0 or end < 0:
+              raise SystemExit("Could not isolate MCMC_tvp() in pinned source.")
+          prefix, block, suffix = s[:start], s[start:end], s[end:]
+          
+          def replace_once(text, old, new, label):
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f"{label}: expected exactly one occurrence, found {n}.")
+              return text.replace(old, new, 1)
+          
+          # 1) Add selective-static index argument.
+          pat = r"(MCMC_tvp <- function\([^\n]*?cons\.mod=TRUE,)(nr,thin=0\.1,)"
+          block2, n = re.subn(pat, r"\1static_idx=integer(0),\2", block, count=1)
+          if n != 1:
+              raise SystemExit("Failed to add static_idx to MCMC_tvp signature.")
+          block = block2
+          
+          # 2) Validate static indices immediately after K_ is defined.
+          marker = "    K_ <- ncol(X__)\n"
+          insert = "\n".join([
+              marker.rstrip("\n"),
+              "    static_idx <- sort(unique(as.integer(static_idx)))",
+              "    if (length(static_idx) > 0L) {",
+              "      if (any(!is.finite(static_idx)) || any(static_idx < 1L) || any(static_idx > K_)) {",
+              "        stop(\"static_idx contains invalid coefficient positions.\")",
+              "      }",
+              "    }",
+          ]) + "\n"
+          block = replace_once(block, marker, insert, "K_ static-index insertion")
+          
+          # 3) Static coefficients start with zero state-innovation variances.
+          marker = "    sqrttheta2 <-diag(K_)*0.01\n"
+          insert = "\n".join([
+              marker.rstrip("\n"),
+              "    if (length(static_idx) > 0L) {",
+              "      for (jj in static_idx) {",
+              "        sqrttheta1[jj,jj] <- 0",
+              "        sqrttheta2[jj,jj] <- 0",
+              "      }",
+              "    }",
+          ]) + "\n"
+          block = replace_once(block, marker, insert, "initial state-variance restriction")
+          
+          # 4) Static coefficients are never classified as time varying.
+          marker = "    D_t <- matrix(1,K_,T)\n"
+          insert = "\n".join([
+              marker.rstrip("\n"),
+              "    if (length(static_idx) > 0L) D_t[static_idx,] <- 0",
+          ]) + "\n"
+          block = replace_once(block, marker, insert, "initial D_t restriction")
+          
+          # 5) The package variance-update loop still draws proposals for all terms.
+          #    Immediately discard proposals for static terms and set their Q entries to 0.
+          marker = "        #Sample hyperparameter lambda from G(a,b)\n"
+          insert = "\n".join([
+              "        if (length(static_idx) > 0L) {",
+              "          for (jj in static_idx) {",
+              "            sqrttheta1[jj,jj] <- 0",
+              "            sqrttheta2[jj,jj] <- 0",
+              "          }",
+              "        }",
+              marker.rstrip("\n"),
+          ]) + "\n"
+          block = replace_once(block, marker, insert, "post-variance static reset")
+          
+          # 6) get_threshold() cannot evaluate sigma=0. Give static coordinates a harmless
+          #    temporary variance only during the threshold calculation; then reset them
+          #    to Q=0 and D_t=0 BEFORE the next state transition.
+          marker = "          grid.mat <- matrix(unlist(lapply(1:K_,function(x) get_grid(Achg[x,],sqrt(sqrttheta1[x,x]),grid.length=grid.length,thrsh.pct=thrsh.pct,thrsh.pct.high=thrsh.pct.high))), ncol = K_)\n"
+          insert = "\n".join([
+              "          if (length(static_idx) > 0L) {",
+              "            for (jj in static_idx) {",
+              "              sqrttheta1[jj,jj] <- 1",
+              "              sqrttheta2[jj,jj] <- 1",
+              "            }",
+              "          }",
+              marker.rstrip("\n"),
+          ]) + "\n"
+          block = replace_once(block, marker, insert, "threshold temporary-variance insertion")
+          
+          marker = "          if (sim.kappa){\n"
+          insert = "\n".join([
+              "          if (length(static_idx) > 0L) {",
+              "            for (jj in static_idx) {",
+              "              sqrttheta1[jj,jj] <- 0",
+              "              sqrttheta2[jj,jj] <- 0",
+              "              d[jj,] <- 0",
+              "              D_t[jj,] <- 0",
+              "            }",
+              "          }",
+              marker.rstrip("\n"),
+          ]) + "\n"
+          block = replace_once(block, marker, insert, "post-threshold static reset")
+          
+          # 7) Keep the already-validated 10c sampler-only stronger SV transition.
+          old = "draws=1, burnin=0"
+          new = f"draws=1, burnin={inner}"
+          if block.count(old) != 1:
+              raise SystemExit("Expected exactly one draws=1,burnin=0 call in MCMC_tvp().")
+          block = block.replace(old, new, 1)
+          
+          s_patched = prefix + block + suffix
+          
+          # 8) Thread static_idx through estimate_tvp() to all three MCMC_tvp call sites.
+          pat = r"(estimate_tvp <- function\([^\n]*?cons\.mod=FALSE,)(p=NULL,)"
+          est2, n = re.subn(pat, r"\1static_idx=integer(0),\2", est, count=1)
+          if n != 1:
+              raise SystemExit("Failed to add static_idx to estimate_tvp signature.")
+          est = est2
+          
+          old = "cons.mod=cons.mod,nr="
+          if est.count(old) != 3:
+              raise SystemExit(f"Expected 3 MCMC_tvp forwarding calls; found {est.count(old)}.")
+          est = est.replace(old, "cons.mod=cons.mod,static_idx=static_idx,nr=")
+          
+          # Strong invariants.
+          for needle in [
+              "static_idx=integer(0)",
+              "D_t[static_idx,] <- 0",
+              f"draws=1, burnin={inner}",
+          ]:
+              if needle not in s_patched:
+                  raise SystemExit(f"Missing patched MCMC invariant: {needle}")
+          if est.count("static_idx=static_idx") != 3:
+              raise SystemExit("static_idx was not forwarded exactly three times.")
+          
+          mcmc_path.write_text(s_patched, encoding="utf-8")
+          est_path.write_text(est, encoding="utf-8")
+          print("10k threshtvp selective-static patch: PASS")
+          print(f"MCMC_tvp SV inner burn-in: {inner}")
+          PY
+
+          git -C threshtvp_src diff -- R/MCMC_function.R R/tvp_estimate.R \
+            > 10k_threshtvp_selective_static.patch
+
+          test -s 10k_threshtvp_selective_static.patch
+
+          echo "===== SELECTIVE-STATIC SAMPLER PATCH ====="
+          cat 10k_threshtvp_selective_static.patch
+
+          R CMD INSTALL \
+            --preclean \
+            --clean \
+            --no-multiarch \
+            --with-keep.source \
+            threshtvp_src
+
+      - name: Build auditable 10k estimator from baseline R/60
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          
+          src = Path("R/60_formal_bayesian_tvp_gvar.R")
+          dst = Path("R/60_10k_static_contemporaneous_foreign.R")
+          s = src.read_text(encoding="utf-8")
+          
+          def replace_once(text, old, new, label):
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f"{label}: expected exactly one occurrence, found {n}.")
+              return text.replace(old, new, 1)
+          
+          # Define the same restriction for every equation.
+          marker = "# =============================================================================\n# 2. Event-anchor table\n# =============================================================================\n"
+          block = "\n".join([
+              "# =============================================================================",
+              "# 10k selective-static specification",
+              "# =============================================================================",
+              "",
+              "STATIC_TERMS <- paste0(VARS, \"_star_0\")",
+              "STATIC_IDX <- match(STATIC_TERMS, TERMS)",
+              "if (any(is.na(STATIC_IDX))) stopf(\"10k static contemporaneous-foreign term missing.\")",
+              "if (!identical(STATIC_TERMS, c(\"r_star_0\",\"de_star_0\",\"deq_star_0\"))) stopf(\"Unexpected 10k static-term contract.\")",
+              "msg(\"10k static terms: %s\", paste(STATIC_TERMS, collapse=\", \"))",
+              "",
+          ])
+          s = replace_once(s, marker, block + marker, "10k restriction block")
+          
+          # Pass static indices to the patched sampler.
+          old = "    cons.mod = FALSE,\n"
+          new = old + "    static_idx = STATIC_IDX,\n"
+          s = replace_once(s, old, new, "estimate_tvp static_idx argument")
+          
+          # Record the restriction in equation summaries.
+          old = "    TVS = TVS_ON,\n    stringsAsFactors = FALSE\n"
+          new = "    TVS = TVS_ON,\n    StaticContemporaneousForeign = TRUE,\n    stringsAsFactors = FALSE\n"
+          s = replace_once(s, old, new, "equation-summary metadata")
+          
+          # Record exact restriction and pinned source identity in RDS metadata.
+          old = "    sv_on = SV_ON,\n    tvs_on = TVS_ON,\n    prior_B1 = PRIOR_B1,\n"
+          new = "\n".join([
+              "    sv_on = SV_ON,",
+              "    tvs_on = TVS_ON,",
+              "    restriction_id = \"STATIC_ALL_CONTEMPORANEOUS_FOREIGN_STAR\",",
+              "    static_terms = STATIC_TERMS,",
+              "    static_idx = STATIC_IDX,",
+              "    threshtvp_base_sha = Sys.getenv(\"FIN3_THRESHTVP_BASE_SHA\"),",
+              "    sv_inner_burnin = as.integer(Sys.getenv(\"FIN3_SV_INNER_BURNIN\")),",
+              "    prior_B1 = PRIOR_B1,",
+          ]) + "\n"
+          s = replace_once(s, old, new, "posterior metadata")
+          
+          # Make the chain README self-describing.
+          old = "  sprintf(\"Latent-threshold TVP: %s\", TVS_ON),\n  sprintf(\"threshtvp version: %s\", pkg_version),\n"
+          new = "\n".join([
+              "  sprintf(\"Latent-threshold TVP: %s\", TVS_ON),",
+              "  \"10k restriction: r_star_0, de_star_0, deq_star_0 are time-invariant in every equation.\",",
+              "  sprintf(\"SV inner burn-in: %s\", Sys.getenv(\"FIN3_SV_INNER_BURNIN\")),",
+              "  sprintf(\"Pinned threshtvp base SHA: %s\", Sys.getenv(\"FIN3_THRESHTVP_BASE_SHA\")),",
+              "  sprintf(\"threshtvp version: %s\", pkg_version),",
+          ]) + "\n"
+          s = replace_once(s, old, new, "README restriction metadata")
+          
+          dst.write_text(s, encoding="utf-8")
+          print("Generated", dst)
+          PY
+
+          test -s R/60_10k_static_contemporaneous_foreign.R
+
+          diff -u \
+            R/60_formal_bayesian_tvp_gvar.R \
+            R/60_10k_static_contemporaneous_foreign.R \
+            > 10k_estimator_restriction.patch || true
+
+          test -s 10k_estimator_restriction.patch
+
+          echo "===== ESTIMATOR RESTRICTION PATCH ====="
+          cat 10k_estimator_restriction.patch
+
+      - name: Run 10k SG restricted-TVP MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/60_10k_static_contemporaneous_foreign.R
+
+      - name: Validate metadata and exact static restriction
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+          root <- file.path(
+            "results","formal_tvp_parts","SG",paste0("chain_",ch)
+          )
+
+          f <- list.files(
+            root,
+            pattern=paste0("^formal_tvp_SG_chain",ch,"[.]rds$"),
+            full.names=TRUE
+          )
+          if (length(f) != 1L) stop("Expected exactly one SG posterior RDS.")
+
+          z <- readRDS(f)
+
+          expected_static <- c("r_star_0","de_star_0","deq_star_0")
+
+          stopifnot(as.character(z$meta$country) == "SG")
+          stopifnot(as.integer(z$meta$chain) == ch)
+          stopifnot(isTRUE(z$meta$sv_on))
+          stopifnot(isTRUE(z$meta$tvs_on))
+          stopifnot(
+            identical(
+              as.character(z$meta$restriction_id),
+              "STATIC_ALL_CONTEMPORANEOUS_FOREIGN_STAR"
+            )
+          )
+          stopifnot(
+            identical(as.character(z$meta$static_terms), expected_static)
+          )
+          stopifnot(
+            identical(as.integer(z$meta$static_idx), match(expected_static,z$meta$terms))
+          )
+          stopifnot(
+            as.character(z$meta$threshtvp_base_sha) ==
+              "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+          )
+          stopifnot(
+            as.integer(z$meta$sv_inner_burnin) ==
+              as.integer(Sys.getenv("FIN3_SV_INNER_BURNIN"))
+          )
+          stopifnot(as.character(z$meta$main_network) == "trade_2000_2012")
+          stopifnot(
+            basename(as.character(z$meta$source_panel)) ==
+              "panel_domestic_fin3_rate_diff.csv"
+          )
+          stopifnot(abs(as.numeric(z$meta$prior_B1)-2) < 1e-12)
+          stopifnot(abs(as.numeric(z$meta$prior_B2)-1) < 1e-12)
+          stopifnot(abs(as.numeric(z$meta$kappa0)-1e-4) < 1e-12)
+
+          # Static terms must have posterior P(time-varying)=0 for every date/equation.
+          for (eq in z$meta$variables) {
+            for (st in expected_static) {
+              p <- as.numeric(z$tv_probability[,st,eq])
+              if (any(!is.finite(p)) || max(abs(p)) > 1e-14) {
+                stop("Nonzero TV probability for static term: ",eq,"/",st)
+              }
+            }
+          }
+
+          # Their state-innovation scale omega must be exactly zero.
+          mon <- as.matrix(z$monitor)
+          for (eq in z$meta$variables) {
+            for (st in expected_static) {
+              nm <- paste0(eq,"__omega__",st)
+              if (!nm %in% colnames(mon)) {
+                stop("Missing static omega monitor: ",nm)
+              }
+              if (max(abs(mon[,nm])) > 1e-14) {
+                stop("Nonzero omega for static term: ",nm)
+              }
+            }
+          }
+
+          # Event-date coefficient draws must be identical across all anchors
+          # within each draw because the coefficient path is time-invariant.
+          A <- z$event_coef
+          for (eq in z$meta$variables) {
+            for (st in expected_static) {
+              base <- as.numeric(A[,1,eq,st])
+              maxdev <- 0
+              for (a in seq_len(dim(A)[2])) {
+                maxdev <- max(
+                  maxdev,
+                  max(abs(as.numeric(A[,a,eq,st]) - base))
+                )
+              }
+              if (!is.finite(maxdev) || maxdev > 1e-8) {
+                stop(
+                  "Static event coefficient varies across anchors: ",
+                  eq,"/",st," maxdev=",maxdev
+                )
+              }
+            }
+          }
+
+          file.copy(
+            "10k_threshtvp_selective_static.patch",
+            file.path(root,"10k_threshtvp_selective_static.patch"),
+            overwrite=TRUE
+          )
+          file.copy(
+            "10k_estimator_restriction.patch",
+            file.path(root,"10k_estimator_restriction.patch"),
+            overwrite=TRUE
+          )
+          file.copy(
+            "R/60_10k_static_contemporaneous_foreign.R",
+            file.path(root,"60_10k_static_contemporaneous_foreign.R"),
+            overwrite=TRUE
+          )
+
+          cat("10K RESTRICTION IMPLEMENTATION AUDIT: PASS\n")
+          RS
+
+      - name: Upload 10k SG restricted posterior
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10k-sg-static-foreign0-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/SG/chain_${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  diagnose:
+    needs: estimate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+
+    steps:
+      - name: Download all four 10k SG posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10k-sg-static-foreign0-chain*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Diagnose convergence and restriction integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/10k_sg_static_foreign0_diagnostic
+
+          Rscript --vanilla - <<'RS'
+          if (!requireNamespace("posterior", quietly=TRUE)) {
+            stop("posterior package is required.")
+          }
+
+          root <- "posterior_parts"
+          out <- "results/10k_sg_static_foreign0_diagnostic"
+
+          expected_draws <- as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN"))
+          rhat_target <- as.numeric(Sys.getenv("FIN3_RHAT_TARGET"))
+          rhat_hard <- as.numeric(Sys.getenv("FIN3_RHAT_HARD"))
+          ess_target <- as.numeric(Sys.getenv("FIN3_ESS_TARGET"))
+          ess_hard <- as.numeric(Sys.getenv("FIN3_ESS_HARD"))
+
+          expected_static <- c("r_star_0","de_star_0","deq_star_0")
+          expected_vars <- c("r","de","deq")
+
+          files <- list.files(
+            root,
+            pattern="^formal_tvp_SG_chain[1-4][.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+
+          if (length(files) != 4L) {
+            stop("Expected 4 SG posterior RDS files; found ",length(files))
+          }
+
+          idx <- do.call(rbind,lapply(files,function(f) {
+            z <- readRDS(f)
+            data.frame(
+              Country=as.character(z$meta$country),
+              Chain=as.integer(z$meta$chain),
+              Burn=as.integer(z$meta$burn),
+              Keep=as.integer(z$meta$keep_internal),
+              Stored=as.integer(z$meta$stored_draws),
+              SV=isTRUE(z$meta$sv_on),
+              TVS=isTRUE(z$meta$tvs_on),
+              Restriction=as.character(z$meta$restriction_id),
+              StaticTerms=paste(as.character(z$meta$static_terms),collapse=";"),
+              Kappa0=as.numeric(z$meta$kappa0),
+              SVInnerBurnin=as.integer(z$meta$sv_inner_burnin),
+              File=f,
+              stringsAsFactors=FALSE
+            )
+          }))
+
+          idx <- idx[order(idx$Chain),]
+
+          if (!identical(idx$Chain,1:4)) stop("SG chain grid mismatch.")
+          if (any(idx$Country!="SG")) stop("Unexpected country.")
+          if (any(idx$Stored!=expected_draws)) stop("Stored draw mismatch.")
+          if (!all(idx$SV) || !all(idx$TVS)) stop("SV/TVS contract mismatch.")
+          if (any(abs(idx$Kappa0-1e-4)>1e-12)) stop("kappa mismatch.")
+          if (length(unique(idx$SVInnerBurnin)) != 1L) {
+            stop("SV inner burn-in differs across chains.")
+          }
+          if (any(
+            idx$Restriction!="STATIC_ALL_CONTEMPORANEOUS_FOREIGN_STAR"
+          )) {
+            stop("Restriction ID mismatch.")
+          }
+          if (any(
+            idx$StaticTerms!="r_star_0;de_star_0;deq_star_0"
+          )) {
+            stop("Static-term metadata mismatch.")
+          }
+
+          write.csv(
+            idx,
+            file.path(out,"00_parts_index.csv"),
+            row.names=FALSE
+          )
+
+          # ---------------------------------------------------------------
+          # Restriction integrity audit for every chain/equation/static term.
+          # ---------------------------------------------------------------
+          restriction_rows <- list()
+          rr <- 0L
+
+          for (i in seq_len(nrow(idx))) {
+            z <- readRDS(idx$File[i])
+            mon <- as.matrix(z$monitor)
+            A <- z$event_coef
+
+            for (eq in expected_vars) {
+              for (st in expected_static) {
+                rr <- rr+1L
+
+                tv <- as.numeric(z$tv_probability[,st,eq])
+                tvmax <- max(abs(tv))
+
+                onm <- paste0(eq,"__omega__",st)
+                if (!onm %in% colnames(mon)) {
+                  stop("Missing omega monitor ",onm)
+                }
+                omax <- max(abs(mon[,onm]))
+
+                base <- as.numeric(A[,1,eq,st])
+                maxdev <- 0
+                for (a in seq_len(dim(A)[2])) {
+                  maxdev <- max(
+                    maxdev,
+                    max(abs(as.numeric(A[,a,eq,st])-base))
+                  )
+                }
+
+                restriction_rows[[rr]] <- data.frame(
+                  Chain=idx$Chain[i],
+                  Equation=eq,
+                  Term=st,
+                  MaxTVProbability=tvmax,
+                  MaxAbsOmega=omax,
+                  MaxEventAnchorDeviation=maxdev,
+                  Pass=is.finite(tvmax) &&
+                       is.finite(omax) &&
+                       is.finite(maxdev) &&
+                       tvmax<=1e-14 &&
+                       omax<=1e-14 &&
+                       maxdev<=1e-8,
+                  stringsAsFactors=FALSE
+                )
+              }
+            }
+          }
+
+          restriction_audit <- do.call(rbind,restriction_rows)
+          write.csv(
+            restriction_audit,
+            file.path(out,"01_static_restriction_integrity.csv"),
+            row.names=FALSE
+          )
+
+          if (!all(restriction_audit$Pass)) {
+            stop("Selective-static restriction integrity audit failed.")
+          }
+
+          # ---------------------------------------------------------------
+          # Build convergence matrices.
+          # Existing monitor + explicit static coefficient level draws.
+          # ---------------------------------------------------------------
+          chains <- lapply(1:4,function(ch) {
+            z <- readRDS(idx$File[idx$Chain==ch])
+            m <- as.data.frame(as.matrix(z$monitor), check.names=FALSE)
+
+            if (nrow(m)!=expected_draws) {
+              stop("Monitor draw mismatch in chain ",ch)
+            }
+
+            A <- z$event_coef
+
+            for (eq in expected_vars) {
+              for (st in expected_static) {
+                nm <- paste0(eq,"__static_coef__",st)
+                m[[nm]] <- as.numeric(A[,1,eq,st])
+              }
+            }
+
+            as.matrix(m)
+          })
+
+          pars <- colnames(chains[[1]])
+          if (!all(vapply(
+            chains,
+            function(x) identical(colnames(x),pars),
+            logical(1)
+          ))) {
+            stop("Convergence-monitor columns differ across chains.")
+          }
+
+          diag_rows <- list()
+          chain_rows <- list()
+          dr <- 0L
+          cr <- 0L
+
+          safe_metric <- function(fun, mat, bad) {
+            out <- try(fun(mat), silent=TRUE)
+            if (inherits(out,"try-error") || length(out)!=1L ||
+                !is.finite(out)) {
+              return(bad)
+            }
+            as.numeric(out)
+          }
+
+          for (j in seq_along(pars)) {
+            mat <- do.call(cbind,lapply(chains,function(x)x[,j]))
+            finite <- all(is.finite(mat))
+            globally_constant <- finite &&
+              (max(mat)-min(mat) < 1e-12)
+
+            if (finite && !globally_constant) {
+              rh <- safe_metric(posterior::rhat, mat, Inf)
+              eb <- safe_metric(posterior::ess_bulk, mat, 0)
+              et <- safe_metric(posterior::ess_tail, mat, 0)
+            } else {
+              rh <- eb <- et <- NA_real_
+            }
+
+            active <- finite && !globally_constant
+
+            dr <- dr+1L
+            diag_rows[[dr]] <- data.frame(
+              Parameter=pars[j],
+              ActiveDiagnostic=active,
+              GloballyConstant=globally_constant,
+              Finite=finite,
+              Rhat=rh,
+              ESS_Bulk=eb,
+              ESS_Tail=et,
+              PassRhatTarget=!active || (is.finite(rh) && rh<=rhat_target),
+              PassRhatHard=!active || (is.finite(rh) && rh<=rhat_hard),
+              PassBulkTarget=!active || (is.finite(eb) && eb>=ess_target),
+              PassBulkHard=!active || (is.finite(eb) && eb>=ess_hard),
+              PassTailTarget=!active || (is.finite(et) && et>=ess_target),
+              PassTailHard=!active || (is.finite(et) && et>=ess_hard),
+              stringsAsFactors=FALSE
+            )
+
+            for (ch in 1:4) {
+              vals <- mat[,ch]
+              cr <- cr+1L
+              chain_rows[[cr]] <- data.frame(
+                Parameter=pars[j],
+                Chain=ch,
+                Mean=mean(vals),
+                SD=stats::sd(vals),
+                Q05=unname(stats::quantile(vals,.05)),
+                Q50=unname(stats::quantile(vals,.50)),
+                Q95=unname(stats::quantile(vals,.95)),
+                stringsAsFactors=FALSE
+              )
+            }
+          }
+
+          d <- do.call(rbind,diag_rows)
+          cs <- do.call(rbind,chain_rows)
+
+          active <- d[d$ActiveDiagnostic,]
+          if (!nrow(active)) stop("No active diagnostics.")
+
+          hard <- active[
+            !active$Finite |
+            !is.finite(active$Rhat) |
+            !is.finite(active$ESS_Bulk) |
+            !is.finite(active$ESS_Tail) |
+            active$Rhat>rhat_hard |
+            active$ESS_Bulk<ess_hard |
+            active$ESS_Tail<ess_hard,
+          ]
+
+          static_diag <- active[
+            grepl("__static_coef__",active$Parameter,fixed=TRUE),
+          ]
+
+          if (nrow(static_diag) != 9L) {
+            stop(
+              "Expected 9 explicit static coefficient diagnostics; found ",
+              nrow(static_diag)
+            )
+          }
+
+          max_rhat <- max(active$Rhat)
+          min_bulk <- min(active$ESS_Bulk)
+          min_tail <- min(active$ESS_Tail)
+
+          rhat_target_share <- mean(active$Rhat<=rhat_target)
+          bulk_target_share <- mean(active$ESS_Bulk>=ess_target)
+          tail_target_share <- mean(active$ESS_Tail>=ess_target)
+
+          full_gate <- (
+            nrow(hard)==0L &&
+            rhat_target_share>=0.95 &&
+            bulk_target_share>=0.90 &&
+            tail_target_share>=0.90 &&
+            all(restriction_audit$Pass)
+          )
+
+          summary <- data.frame(
+            Country="SG",
+            Specification="TVS_TRUE__SV_TRUE__STATIC_ALL_FOREIGN_STAR_0",
+            Chains=4,
+            StoredPerChain=expected_draws,
+            SVInnerBurnin=unique(idx$SVInnerBurnin),
+            ActiveDiagnostics=nrow(active),
+            MaxRhat=max_rhat,
+            RhatTargetShare=rhat_target_share,
+            RhatHardShare=mean(active$Rhat<=rhat_hard),
+            MinESSBulk=min_bulk,
+            MinESSTail=min_tail,
+            ESSBulkTargetShare=bulk_target_share,
+            ESSTailTargetShare=tail_target_share,
+            HardFailCount=nrow(hard),
+            RestrictionIntegrityPass=all(restriction_audit$Pass),
+            DiagnosticPass=full_gate,
+            FormalIRFAuthorized=FALSE,
+            stringsAsFactors=FALSE
+          )
+
+          decision <- data.frame(
+            Item=c(
+              "Restriction",
+              "SGDiagnosticPass",
+              "StaticCoefficientHardFailCount",
+              "AllHardFailCount",
+              "FormalIRFAuthorized",
+              "NextStepIfPass",
+              "NextStepIfFail"
+            ),
+            Value=c(
+              "r_star_0,de_star_0,deq_star_0 static in every equation; all other coefficients TVS+SV",
+              as.character(full_gate),
+              as.character(sum(
+                static_diag$Rhat>rhat_hard |
+                static_diag$ESS_Bulk<ess_hard |
+                static_diag$ESS_Tail<ess_hard
+              )),
+              as.character(nrow(hard)),
+              "FALSE",
+              "Run a NEW 14-country x 4-chain uniform restricted-specification formal validation; do not reuse 10k SG draws as formal posterior.",
+              "Do not run IRF and do not loosen convergence thresholds; reassess mean/SV identification."
+            ),
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(
+            d,
+            file.path(out,"02_parameter_diagnostics.csv"),
+            row.names=FALSE
+          )
+          write.csv(
+            cs,
+            file.path(out,"03_chain_parameter_summary.csv"),
+            row.names=FALSE
+          )
+          write.csv(
+            static_diag,
+            file.path(out,"04_static_foreign0_coefficient_diagnostics.csv"),
+            row.names=FALSE
+          )
+          write.csv(
+            hard,
+            file.path(out,"05_hard_fail_parameters.csv"),
+            row.names=FALSE
+          )
+          write.csv(
+            summary,
+            file.path(out,"06_sg_restricted_spec_summary.csv"),
+            row.names=FALSE
+          )
+          write.csv(
+            decision,
+            file.path(out,"07_decision.csv"),
+            row.names=FALSE
+          )
+
+          cat("\n===== 10K SG RESTRICTED-SPEC SUMMARY =====\n")
+          print(summary)
+
+          cat("\n===== STATIC FOREIGN-0 COEFFICIENT DIAGNOSTICS =====\n")
+          print(
+            static_diag[,c("Parameter","Rhat","ESS_Bulk","ESS_Tail")]
+          )
+
+          cat("\n===== HARD FAIL PARAMETERS =====\n")
+          if (nrow(hard)) {
+            print(hard[,c("Parameter","Rhat","ESS_Bulk","ESS_Tail")])
+          } else {
+            cat("NONE\n")
+          }
+
+          cat("\n===== DECISION =====\n")
+          print(decision)
+
+          cat(
+            "\n10k is SG-only specification diagnosis. ",
+            "FormalIRFAuthorized is deliberately FALSE even when it passes.\n",
+            sep=""
+          )
+          RS
+
+      - name: Upload 10k diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10k-sg-static-foreign0-diagnostic-${{ github.run_id }}
+          path: results/10k_sg_static_foreign0_diagnostic/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce 10k diagnostic gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          f <- "results/10k_sg_static_foreign0_diagnostic/06_sg_restricted_spec_summary.csv"
+          if (!file.exists(f)) stop("Missing 10k summary.")
+          x <- read.csv(f, stringsAsFactors=FALSE, check.names=FALSE)
+          if (nrow(x)!=1L) stop("Malformed 10k summary.")
+          if (!isTRUE(as.logical(x$DiagnosticPass[1]))) {
+            stop(
+              "10k restricted specification did not pass the SG diagnostic gate. ",
+              "Do NOT run IRF and do NOT loosen thresholds."
+            )
+          }
+          if (isTRUE(as.logical(x$FormalIRFAuthorized[1]))) {
+            stop("10k must never authorize formal IRF.")
+          }
+          cat(
+            "10K SG RESTRICTED-SPEC DIAGNOSTIC: PASS\n",
+            "Next: run a fresh 14-country x 4-chain uniform restricted-spec validation.\n",
+            "Formal IRF remains unauthorized at this stage.\n",
+            sep=""
+          )
+          RS
