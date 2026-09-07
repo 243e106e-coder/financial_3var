@@ -1,0 +1,1003 @@
+name: Financial 3var 10j SG foreign-transmission posterior audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Completed 10h run containing all 12 SG posterior chain artifacts"
+        required: true
+        default: "34080566179"
+        type: string
+      geometry_run_id:
+        description: "Completed 10i posterior-geometry audit defining LOW/HIGH chain regions"
+        required: true
+        default: "34083497585"
+        type: string
+      expected_model_ref:
+        description: "Statistical-model SHA recorded by the 10h chain audits"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify_sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      GEOMETRY_RUN_ID: ${{ inputs.geometry_run_id }}
+    steps:
+      - name: Verify 10h posterior source and 10i geometry source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
+          source_status="$(jq -r '.status' <<<"${source_json}")"
+          source_path="$(jq -r '.path' <<<"${source_json}")"
+
+          test "${source_status}" = "completed" || {
+            echo "::error::10h source run is not completed."
+            exit 1
+          }
+          test "${source_path}" = ".github/workflows/10h_sg_sv_initialization_robustness_diagnostic.yml" || {
+            echo "::error::Unexpected 10h workflow path: ${source_path}"
+            exit 1
+          }
+
+          source_artifacts="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100"
+          )"
+          chain_count="$(
+            jq \
+              --arg run "${SOURCE_RUN_ID}" \
+              '[.artifacts[]
+                | select(.expired == false)
+                | select(
+                    .name
+                    | test(
+                        "^financial-3var-10h-sg-svinit-(legacy|ols_centered|diffuse)-chain[1-4]-"
+                        + $run
+                        + "$"
+                      )
+                  )
+               ] | length' \
+              <<<"${source_artifacts}"
+          )"
+
+          test "${chain_count}" = "12" || {
+            echo "::error::Expected 12 non-expired 10h SG chain artifacts; found ${chain_count}."
+            exit 1
+          }
+
+          geometry_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GEOMETRY_RUN_ID}")"
+          geometry_status="$(jq -r '.status' <<<"${geometry_json}")"
+          geometry_conclusion="$(jq -r '.conclusion' <<<"${geometry_json}")"
+          geometry_path="$(jq -r '.path' <<<"${geometry_json}")"
+
+          test "${geometry_status}" = "completed" || {
+            echo "::error::10i geometry run is not completed."
+            exit 1
+          }
+          test "${geometry_conclusion}" = "success" || {
+            echo "::error::10i geometry run did not complete successfully."
+            exit 1
+          }
+          test "${geometry_path}" = ".github/workflows/10i_sg_posterior_geometry_identification_audit.yml" || {
+            echo "::error::Unexpected 10i workflow path: ${geometry_path}"
+            exit 1
+          }
+
+          geometry_artifacts="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GEOMETRY_RUN_ID}/artifacts?per_page=100"
+          )"
+          geometry_count="$(
+            jq \
+              --arg run "${GEOMETRY_RUN_ID}" \
+              '[.artifacts[]
+                | select(.expired == false)
+                | select(.name == ("financial-3var-10i-sg-posterior-geometry-" + $run))
+               ] | length' \
+              <<<"${geometry_artifacts}"
+          )"
+
+          test "${geometry_count}" = "1" || {
+            echo "::error::Expected one non-expired 10i geometry artifact; found ${geometry_count}."
+            exit 1
+          }
+
+          echo "SOURCE INTEGRITY: PASS"
+          echo "10h_run=${SOURCE_RUN_ID}"
+          echo "10h_chain_artifacts=${chain_count}"
+          echo "10i_run=${GEOMETRY_RUN_ID}"
+          echo "10i_geometry_artifacts=${geometry_count}"
+
+  foreign_transmission_audit:
+    needs: verify_sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      GEOMETRY_RUN_ID: ${{ inputs.geometry_run_id }}
+      EXPECTED_MODEL_REF: ${{ inputs.expected_model_ref }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+
+    steps:
+      - name: Download all 12 10h SG posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10h-sg-svinit-*-chain*-${{ inputs.source_run_id }}
+          path: posterior_parts
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Download 10i posterior-geometry classification
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10i-sg-posterior-geometry-${{ inputs.geometry_run_id }}
+          path: geometry
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.geometry_run_id }}
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install posterior diagnostic dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Audit event-level foreign-star transmission coefficients
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          if (!requireNamespace("posterior", quietly=TRUE)) {
+            stop("posterior package is required.")
+          }
+
+          root <- "posterior_parts"
+          geometry_root <- "geometry"
+          out <- file.path("results", "10j_sg_foreign_transmission_audit")
+          dir.create(out, recursive=TRUE, showWarnings=FALSE)
+
+          source_run_id <- Sys.getenv("SOURCE_RUN_ID")
+          geometry_run_id <- Sys.getenv("GEOMETRY_RUN_ID")
+          expected_model_ref <- Sys.getenv("EXPECTED_MODEL_REF")
+
+          rhat_target <- as.numeric(Sys.getenv("FIN3_RHAT_TARGET"))
+          rhat_hard <- as.numeric(Sys.getenv("FIN3_RHAT_HARD"))
+          ess_target <- as.numeric(Sys.getenv("FIN3_ESS_TARGET"))
+          ess_hard <- as.numeric(Sys.getenv("FIN3_ESS_HARD"))
+
+          expected_modes <- c("legacy", "ols_centered", "diffuse")
+          core_quarters <- c("2008Q3", "2020Q1", "2024Q2")
+          equations <- c("r", "de", "deq")
+          foreign_terms <- c(
+            "r_star_0", "de_star_0", "deq_star_0",
+            "r_star_L1", "de_star_L1", "deq_star_L1"
+          )
+          gpr_terms <- c("gpr_0", "gpr_L1")
+
+          as_bool <- function(x) {
+            if (is.logical(x)) return(x)
+            tolower(trimws(as.character(x))) %in% c("true", "t", "1", "yes")
+          }
+
+          safe_rhat <- function(mat) {
+            tryCatch(posterior::rhat(mat), error=function(e) NA_real_)
+          }
+          safe_ess_bulk <- function(mat) {
+            tryCatch(posterior::ess_bulk(mat), error=function(e) NA_real_)
+          }
+          safe_ess_tail <- function(mat) {
+            tryCatch(posterior::ess_tail(mat), error=function(e) NA_real_)
+          }
+          safe_max <- function(x) {
+            x <- x[is.finite(x)]
+            if (!length(x)) NA_real_ else max(x)
+          }
+          safe_median <- function(x) {
+            x <- x[is.finite(x)]
+            if (!length(x)) NA_real_ else stats::median(x)
+          }
+          safe_mean <- function(x) {
+            x <- x[is.finite(x)]
+            if (!length(x)) NA_real_ else mean(x)
+          }
+
+          # ------------------------------------------------------------------
+          # 1. Import the exact chain-region labels from the completed 10i run.
+          #    10j never re-clusters and never drops chains.
+          # ------------------------------------------------------------------
+          class_files <- list.files(
+            geometry_root,
+            pattern="^01_chain_region_classification[.]csv$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+          if (length(class_files) != 1L) {
+            stop(
+              "Expected exactly one 10i 01_chain_region_classification.csv; found ",
+              length(class_files)
+            )
+          }
+
+          classification <- read.csv(
+            class_files[1],
+            stringsAsFactors=FALSE,
+            check.names=FALSE
+          )
+
+          class_need <- c("InitMode", "Chain", "Region")
+          if (!all(class_need %in% names(classification))) {
+            stop(
+              "10i classification is missing: ",
+              paste(setdiff(class_need, names(classification)), collapse=", ")
+            )
+          }
+
+          classification$InitMode <- as.character(classification$InitMode)
+          classification$Chain <- as.integer(classification$Chain)
+          classification$Region <- as.character(classification$Region)
+
+          if (nrow(classification) != 12L) {
+            stop("Expected 12 chain classifications; found ", nrow(classification))
+          }
+          if (!all(classification$InitMode %in% expected_modes)) {
+            stop("Unexpected initialization mode in 10i classification.")
+          }
+          if (!all(classification$Chain %in% 1:4)) {
+            stop("Unexpected chain id in 10i classification.")
+          }
+          if (!all(
+            classification$Region %in%
+              c("LOW_R_L1_REGION", "HIGH_R_L1_REGION")
+          )) {
+            stop("Unexpected region label in 10i classification.")
+          }
+
+          class_key <- paste(
+            classification$InitMode,
+            classification$Chain,
+            sep="||"
+          )
+          if (anyDuplicated(class_key)) {
+            stop("Duplicate InitMode/Chain key in 10i classification.")
+          }
+
+          region_counts <- table(classification$Region)
+          if (length(region_counts) != 2L || any(region_counts < 2L)) {
+            stop(
+              "Need at least two chains in both posterior regions for 10j. Counts: ",
+              paste(names(region_counts), region_counts, collapse=", ")
+            )
+          }
+
+          write.csv(
+            classification,
+            file.path(out, "00_chain_region_classification_from_10i.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------------
+          # 2. Read all 12 compact posterior RDS objects and validate provenance.
+          # ------------------------------------------------------------------
+          rds_files <- list.files(
+            root,
+            pattern="^formal_tvp_SG_chain[1-4][.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+          if (length(rds_files) != 12L) {
+            stop("Expected 12 SG posterior RDS files; found ", length(rds_files))
+          }
+
+          chain_objects <- vector("list", length(rds_files))
+          index_rows <- vector("list", length(rds_files))
+
+          for (ii in seq_along(rds_files)) {
+            f <- rds_files[ii]
+            d <- dirname(f)
+
+            audit_file <- file.path(d, "00_10h_sampler_initialization_audit.csv")
+            deg_file <- file.path(d, "05_chain_degeneracy_audit.csv")
+
+            if (!file.exists(audit_file)) {
+              stop("Missing 10h sampler audit beside ", f)
+            }
+            if (!file.exists(deg_file)) {
+              stop("Missing 10h degeneracy audit beside ", f)
+            }
+
+            a <- read.csv(
+              audit_file,
+              stringsAsFactors=FALSE,
+              check.names=FALSE
+            )
+            g <- read.csv(
+              deg_file,
+              stringsAsFactors=FALSE,
+              check.names=FALSE
+            )
+            z <- readRDS(f)
+
+            if (as.character(a$StatisticalModelSHA[1]) != expected_model_ref) {
+              stop(
+                "Unexpected statistical-model SHA in ",
+                f,
+                ": ",
+                as.character(a$StatisticalModelSHA[1])
+              )
+            }
+
+            if (
+              as_bool(a$StatisticalModelChanged[1]) ||
+              as_bool(a$PriorChanged[1]) ||
+              as_bool(a$GateChanged[1])
+            ) {
+              stop("10h audit reports model/prior/gate change in ", f)
+            }
+
+            if (as.integer(g$DegenerateV0Parameters[1]) != 0L) {
+              stop("10h chain degeneracy audit failed for ", f)
+            }
+
+            stopifnot(as.character(z$meta$country) == "SG")
+            stopifnot(isTRUE(z$meta$sv_on))
+            stopifnot(isTRUE(z$meta$tvs_on))
+            stopifnot(abs(as.numeric(z$meta$prior_B1) - 2) < 1e-12)
+            stopifnot(abs(as.numeric(z$meta$prior_B2) - 1) < 1e-12)
+            stopifnot(abs(as.numeric(z$meta$kappa0) - 1e-4) < 1e-12)
+            stopifnot(
+              as.character(z$meta$main_network) == "trade_2000_2012"
+            )
+            stopifnot(
+              basename(as.character(z$meta$source_panel)) ==
+                "panel_domestic_fin3_rate_diff.csv"
+            )
+
+            if (is.null(z$event_coef) || length(dim(z$event_coef)) != 4L) {
+              stop("Missing or malformed event_coef array in ", f)
+            }
+            if (is.null(z$anchors) || !is.data.frame(z$anchors)) {
+              stop("Missing anchors data.frame in ", f)
+            }
+
+            mode <- as.character(a$InitMode[1])
+            chain <- as.integer(z$meta$chain)
+            key <- paste(mode, chain, sep="||")
+            region <- classification$Region[match(key, class_key)]
+
+            if (length(region) != 1L || is.na(region)) {
+              stop("No 10i region label for ", key)
+            }
+
+            dn <- dimnames(z$event_coef)
+            if (is.null(dn) || length(dn) != 4L) {
+              stop("event_coef has no complete dimnames in ", f)
+            }
+
+            eq_names <- dn[[3]]
+            term_names <- dn[[4]]
+            if (!all(equations %in% eq_names)) {
+              stop(
+                "event_coef missing equation(s): ",
+                paste(setdiff(equations, eq_names), collapse=", ")
+              )
+            }
+            if (!all(c(foreign_terms, gpr_terms) %in% term_names)) {
+              stop(
+                "event_coef missing key term(s): ",
+                paste(
+                  setdiff(c(foreign_terms, gpr_terms), term_names),
+                  collapse=", "
+                )
+              )
+            }
+
+            if (any(!is.finite(z$event_coef))) {
+              stop("Non-finite event_coef draw(s) in ", f)
+            }
+
+            chain_objects[[ii]] <- list(
+              file=f,
+              mode=mode,
+              chain=chain,
+              region=region,
+              z=z
+            )
+
+            index_rows[[ii]] <- data.frame(
+              File=f,
+              InitMode=mode,
+              Chain=chain,
+              Region=region,
+              StoredDraws=dim(z$event_coef)[1],
+              Anchors=dim(z$event_coef)[2],
+              Equations=dim(z$event_coef)[3],
+              KeyTerms=dim(z$event_coef)[4],
+              StatisticalModelSHA=as.character(a$StatisticalModelSHA[1]),
+              SV=isTRUE(z$meta$sv_on),
+              TVS=isTRUE(z$meta$tvs_on),
+              DegenerateV0Parameters=as.integer(g$DegenerateV0Parameters[1]),
+              stringsAsFactors=FALSE
+            )
+          }
+
+          idx <- do.call(rbind, index_rows)
+          got_key <- paste(idx$InitMode, idx$Chain, sep="||")
+          expected_grid <- expand.grid(
+            InitMode=expected_modes,
+            Chain=1:4,
+            stringsAsFactors=FALSE
+          )
+          expected_key <- paste(
+            expected_grid$InitMode,
+            expected_grid$Chain,
+            sep="||"
+          )
+
+          if (anyDuplicated(got_key)) {
+            stop("Duplicate InitMode/Chain posterior object.")
+          }
+          if (length(setdiff(expected_key, got_key))) {
+            stop(
+              "Missing posterior object(s): ",
+              paste(setdiff(expected_key, got_key), collapse=", ")
+            )
+          }
+
+          ord <- order(match(idx$InitMode, expected_modes), idx$Chain)
+          idx <- idx[ord, , drop=FALSE]
+          chain_objects <- chain_objects[ord]
+
+          draw_counts <- vapply(
+            chain_objects,
+            function(x) dim(x$z$event_coef)[1],
+            integer(1)
+          )
+          if (length(unique(draw_counts)) != 1L) {
+            stop("Stored event_coef draw counts differ across chains.")
+          }
+
+          ref_anchors <- chain_objects[[1]]$z$anchors
+          ref_event_dimnames <- dimnames(chain_objects[[1]]$z$event_coef)
+
+          for (ii in seq_along(chain_objects)) {
+            z <- chain_objects[[ii]]$z
+            if (!identical(z$anchors, ref_anchors)) {
+              stop("Anchor metadata differs across SG chains.")
+            }
+            if (!identical(dimnames(z$event_coef)[[2]], ref_event_dimnames[[2]]) ||
+                !identical(dimnames(z$event_coef)[[3]], ref_event_dimnames[[3]]) ||
+                !identical(dimnames(z$event_coef)[[4]], ref_event_dimnames[[4]])) {
+              stop("event_coef dimensions/dimnames differ across SG chains.")
+            }
+          }
+
+          write.csv(
+            idx,
+            file.path(out, "01_parts_index.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------------
+          # 3. Identify the exact EVENT_QUARTER_t0 anchors for the three core
+          #    crisis/event quarters. No nearest-date substitution is allowed.
+          # ------------------------------------------------------------------
+          anchor_need <- c(
+            "EventID", "EventQuarter", "AnchorType", "AnchorQuarter"
+          )
+          if (!all(anchor_need %in% names(ref_anchors))) {
+            stop(
+              "Anchor table missing: ",
+              paste(setdiff(anchor_need, names(ref_anchors)), collapse=", ")
+            )
+          }
+
+          anchor_map_rows <- list()
+          for (qq in core_quarters) {
+            hit <- which(
+              as.character(ref_anchors$AnchorQuarter) == qq &
+              as.character(ref_anchors$AnchorType) == "EVENT_QUARTER_t0"
+            )
+            if (length(hit) != 1L) {
+              stop(
+                "Expected exactly one EVENT_QUARTER_t0 anchor for ",
+                qq,
+                "; found ",
+                length(hit)
+              )
+            }
+            anchor_map_rows[[qq]] <- data.frame(
+              Quarter=qq,
+              AnchorIndex=hit,
+              EventID=as.character(ref_anchors$EventID[hit]),
+              EventQuarter=as.character(ref_anchors$EventQuarter[hit]),
+              AnchorType=as.character(ref_anchors$AnchorType[hit]),
+              AnchorQuarter=as.character(ref_anchors$AnchorQuarter[hit]),
+              stringsAsFactors=FALSE
+            )
+          }
+          anchor_map <- do.call(rbind, anchor_map_rows)
+          rownames(anchor_map) <- NULL
+
+          write.csv(
+            anchor_map,
+            file.path(out, "02_core_anchor_map.csv"),
+            row.names=FALSE
+          )
+
+          anchor_index <- setNames(anchor_map$AnchorIndex, anchor_map$Quarter)
+
+          # ------------------------------------------------------------------
+          # 4. Build draw matrices for:
+          #       54 foreign-star parameters =
+          #       3 quarters x 3 equations x 6 foreign-star terms
+          #    plus GPR current/lag as a comparison block.
+          # ------------------------------------------------------------------
+          spec_rows <- list()
+          ss <- 0L
+
+          for (qq in core_quarters) {
+            for (eq in equations) {
+              for (term in foreign_terms) {
+                ss <- ss + 1L
+                spec_rows[[ss]] <- data.frame(
+                  Kind="FOREIGN_STAR",
+                  Quarter=qq,
+                  Equation=eq,
+                  Term=term,
+                  Parameter=paste(eq, "coef", qq, term, sep="__"),
+                  stringsAsFactors=FALSE
+                )
+              }
+              for (term in gpr_terms) {
+                ss <- ss + 1L
+                spec_rows[[ss]] <- data.frame(
+                  Kind="GPR",
+                  Quarter=qq,
+                  Equation=eq,
+                  Term=term,
+                  Parameter=paste(eq, "coef", qq, term, sep="__"),
+                  stringsAsFactors=FALSE
+                )
+              }
+            }
+          }
+
+          specs <- do.call(rbind, spec_rows)
+
+          extract_draw <- function(obj, quarter, equation, term) {
+            z <- obj$z
+            ai <- anchor_index[[quarter]]
+            ei <- match(equation, dimnames(z$event_coef)[[3]])
+            ti <- match(term, dimnames(z$event_coef)[[4]])
+
+            if (is.na(ai) || is.na(ei) || is.na(ti)) {
+              stop(
+                "Cannot locate event_coef slice: ",
+                quarter, "/", equation, "/", term
+              )
+            }
+
+            x <- as.numeric(z$event_coef[, ai, ei, ti])
+            if (length(x) != draw_counts[1] || any(!is.finite(x))) {
+              stop(
+                "Malformed event_coef draw vector: ",
+                quarter, "/", equation, "/", term
+              )
+            }
+            x
+          }
+
+          # Chain-level posterior summaries.
+          chain_param_rows <- list()
+          cc <- 0L
+          for (pp in seq_len(nrow(specs))) {
+            s <- specs[pp, , drop=FALSE]
+            for (ii in seq_along(chain_objects)) {
+              x <- extract_draw(
+                chain_objects[[ii]],
+                s$Quarter,
+                s$Equation,
+                s$Term
+              )
+              cc <- cc + 1L
+              chain_param_rows[[cc]] <- data.frame(
+                Kind=s$Kind,
+                Quarter=s$Quarter,
+                Equation=s$Equation,
+                Term=s$Term,
+                Parameter=s$Parameter,
+                InitMode=chain_objects[[ii]]$mode,
+                Chain=chain_objects[[ii]]$chain,
+                Region=chain_objects[[ii]]$region,
+                Mean=mean(x),
+                SD=stats::sd(x),
+                Q05=stats::quantile(x, .05, names=FALSE),
+                Median=stats::median(x),
+                Q95=stats::quantile(x, .95, names=FALSE),
+                PrPositive=mean(x > 0),
+                stringsAsFactors=FALSE
+              )
+            }
+          }
+          chain_param_summary <- do.call(rbind, chain_param_rows)
+
+          write.csv(
+            chain_param_summary,
+            file.path(out, "03_chain_parameter_summary.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------------
+          # 5. R-hat/ESS separately in LOW, HIGH, and pooled chains.
+          # ------------------------------------------------------------------
+          group_defs <- list(
+            LOW_R_L1_REGION=which(
+              vapply(
+                chain_objects,
+                function(x) x$region == "LOW_R_L1_REGION",
+                logical(1)
+              )
+            ),
+            HIGH_R_L1_REGION=which(
+              vapply(
+                chain_objects,
+                function(x) x$region == "HIGH_R_L1_REGION",
+                logical(1)
+              )
+            ),
+            POOLED_ALL_CHAINS=seq_along(chain_objects)
+          )
+
+          diag_rows <- list()
+          region_post_rows <- list()
+          dd <- 0L
+          rr <- 0L
+
+          for (pp in seq_len(nrow(specs))) {
+            s <- specs[pp, , drop=FALSE]
+
+            full_mat <- do.call(
+              cbind,
+              lapply(
+                chain_objects,
+                extract_draw,
+                quarter=s$Quarter,
+                equation=s$Equation,
+                term=s$Term
+              )
+            )
+
+            colnames(full_mat) <- paste(
+              vapply(chain_objects, `[[`, character(1), "mode"),
+              vapply(chain_objects, `[[`, integer(1), "chain"),
+              sep="_chain"
+            )
+
+            for (group_name in names(group_defs)) {
+              jj <- group_defs[[group_name]]
+              mat <- full_mat[, jj, drop=FALSE]
+              pooled_draws <- as.numeric(mat)
+
+              rhat <- safe_rhat(mat)
+              bulk <- safe_ess_bulk(mat)
+              tail <- safe_ess_tail(mat)
+
+              hard_pass <- (
+                is.finite(rhat) &&
+                is.finite(bulk) &&
+                is.finite(tail) &&
+                rhat <= rhat_hard &&
+                bulk >= ess_hard &&
+                tail >= ess_hard
+              )
+              target_pass <- (
+                is.finite(rhat) &&
+                is.finite(bulk) &&
+                is.finite(tail) &&
+                rhat <= rhat_target &&
+                bulk >= ess_target &&
+                tail >= ess_target
+              )
+
+              dd <- dd + 1L
+              diag_rows[[dd]] <- data.frame(
+                Kind=s$Kind,
+                Quarter=s$Quarter,
+                Equation=s$Equation,
+                Term=s$Term,
+                Parameter=s$Parameter,
+                Group=group_name,
+                Chains=ncol(mat),
+                DrawsPerChain=nrow(mat),
+                Rhat=rhat,
+                ESSBulk=bulk,
+                ESSTail=tail,
+                HardPass=hard_pass,
+                TargetPass=target_pass,
+                stringsAsFactors=FALSE
+              )
+
+              rr <- rr + 1L
+              region_post_rows[[rr]] <- data.frame(
+                Kind=s$Kind,
+                Quarter=s$Quarter,
+                Equation=s$Equation,
+                Term=s$Term,
+                Parameter=s$Parameter,
+                Group=group_name,
+                Chains=ncol(mat),
+                Draws=nrow(mat) * ncol(mat),
+                Mean=mean(pooled_draws),
+                SD=stats::sd(pooled_draws),
+                Q05=stats::quantile(pooled_draws, .05, names=FALSE),
+                Median=stats::median(pooled_draws),
+                Q95=stats::quantile(pooled_draws, .95, names=FALSE),
+                PrPositive=mean(pooled_draws > 0),
+                stringsAsFactors=FALSE
+              )
+            }
+          }
+
+          diagnostics <- do.call(rbind, diag_rows)
+          region_posterior <- do.call(rbind, region_post_rows)
+
+          write.csv(
+            diagnostics,
+            file.path(out, "04_convergence_by_region.csv"),
+            row.names=FALSE
+          )
+          write.csv(
+            region_posterior,
+            file.path(out, "05_region_posterior_summary.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------------
+          # 6. HIGH-versus-LOW sensitivity. This is descriptive, not a new gate.
+          # ------------------------------------------------------------------
+          separation_rows <- list()
+          zz <- 0L
+
+          for (pp in seq_len(nrow(specs))) {
+            s <- specs[pp, , drop=FALSE]
+
+            low <- region_posterior[
+              region_posterior$Parameter == s$Parameter &
+              region_posterior$Group == "LOW_R_L1_REGION",
+              ,
+              drop=FALSE
+            ]
+            high <- region_posterior[
+              region_posterior$Parameter == s$Parameter &
+              region_posterior$Group == "HIGH_R_L1_REGION",
+              ,
+              drop=FALSE
+            ]
+
+            if (nrow(low) != 1L || nrow(high) != 1L) {
+              stop("Missing LOW/HIGH summary for ", s$Parameter)
+            }
+
+            pooled_within_sd <- sqrt(
+              (low$SD^2 + high$SD^2) / 2
+            )
+            standardized_separation <- if (
+              is.finite(pooled_within_sd) &&
+              pooled_within_sd > 1e-14
+            ) {
+              abs(high$Mean - low$Mean) / pooled_within_sd
+            } else {
+              NA_real_
+            }
+
+            sign_flip <- (
+              is.finite(low$Mean) &&
+              is.finite(high$Mean) &&
+              low$Mean != 0 &&
+              high$Mean != 0 &&
+              sign(low$Mean) != sign(high$Mean)
+            )
+
+            zz <- zz + 1L
+            separation_rows[[zz]] <- data.frame(
+              Kind=s$Kind,
+              Quarter=s$Quarter,
+              Equation=s$Equation,
+              Term=s$Term,
+              Parameter=s$Parameter,
+              LowMean=low$Mean,
+              HighMean=high$Mean,
+              HighMinusLow=high$Mean - low$Mean,
+              LowSD=low$SD,
+              HighSD=high$SD,
+              PooledWithinSD=pooled_within_sd,
+              AbsSeparationOverWithinSD=standardized_separation,
+              LowPrPositive=low$PrPositive,
+              HighPrPositive=high$PrPositive,
+              AbsDeltaPrPositive=abs(high$PrPositive - low$PrPositive),
+              MeanSignFlip=sign_flip,
+              stringsAsFactors=FALSE
+            )
+          }
+
+          separation <- do.call(rbind, separation_rows)
+          separation <- separation[
+            order(
+              separation$Kind,
+              -separation$AbsSeparationOverWithinSD,
+              -separation$AbsDeltaPrPositive
+            ),
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            separation,
+            file.path(out, "06_high_low_region_separation.csv"),
+            row.names=FALSE
+          )
+
+          foreign_sep <- separation[
+            separation$Kind == "FOREIGN_STAR",
+            ,
+            drop=FALSE
+          ]
+          gpr_sep <- separation[
+            separation$Kind == "GPR",
+            ,
+            drop=FALSE
+          ]
+
+          write.csv(
+            foreign_sep[
+              order(
+                -foreign_sep$AbsSeparationOverWithinSD,
+                -foreign_sep$AbsDeltaPrPositive
+              ),
+              ,
+              drop=FALSE
+            ],
+            file.path(out, "07_foreign_star_sensitivity_ranked.csv"),
+            row.names=FALSE
+          )
+
+          # ------------------------------------------------------------------
+          # 7. Compact decision/audit summary.
+          #    No automatic "contaminated/not contaminated" threshold is imposed.
+          # ------------------------------------------------------------------
+          get_fail_count <- function(kind, group) {
+            d <- diagnostics[
+              diagnostics$Kind == kind &
+              diagnostics$Group == group,
+              ,
+              drop=FALSE
+            ]
+            sum(!d$HardPass)
+          }
+
+          decision <- data.frame(
+            Source10hRun=source_run_id,
+            Source10iRun=geometry_run_id,
+            Specification="SG__TVS_TRUE__SV_TRUE__TradeW__DeltaR",
+            CoreQuarters=paste(core_quarters, collapse=";"),
+            LowRegionChains=unname(region_counts["LOW_R_L1_REGION"]),
+            HighRegionChains=unname(region_counts["HIGH_R_L1_REGION"]),
+            ForeignStarParameters=nrow(foreign_sep),
+            ForeignStarMaxAbsSeparationOverWithinSD=
+              safe_max(foreign_sep$AbsSeparationOverWithinSD),
+            ForeignStarMedianAbsSeparationOverWithinSD=
+              safe_median(foreign_sep$AbsSeparationOverWithinSD),
+            ForeignStarMaxAbsDeltaPrPositive=
+              safe_max(foreign_sep$AbsDeltaPrPositive),
+            ForeignStarMeanSignFlipCount=sum(
+              foreign_sep$MeanSignFlip,
+              na.rm=TRUE
+            ),
+            ForeignStarLowHardFailCount=
+              get_fail_count("FOREIGN_STAR", "LOW_R_L1_REGION"),
+            ForeignStarHighHardFailCount=
+              get_fail_count("FOREIGN_STAR", "HIGH_R_L1_REGION"),
+            ForeignStarPooledHardFailCount=
+              get_fail_count("FOREIGN_STAR", "POOLED_ALL_CHAINS"),
+            GPRParameters=nrow(gpr_sep),
+            GPRMaxAbsSeparationOverWithinSD=
+              safe_max(gpr_sep$AbsSeparationOverWithinSD),
+            GPRMedianAbsSeparationOverWithinSD=
+              safe_median(gpr_sep$AbsSeparationOverWithinSD),
+            GPRMaxAbsDeltaPrPositive=
+              safe_max(gpr_sep$AbsDeltaPrPositive),
+            GPRMeanSignFlipCount=sum(
+              gpr_sep$MeanSignFlip,
+              na.rm=TRUE
+            ),
+            GPRLowHardFailCount=
+              get_fail_count("GPR", "LOW_R_L1_REGION"),
+            GPRHighHardFailCount=
+              get_fail_count("GPR", "HIGH_R_L1_REGION"),
+            GPRPooledHardFailCount=
+              get_fail_count("GPR", "POOLED_ALL_CHAINS"),
+            AutomaticEconomicContaminationGateApplied=FALSE,
+            FormalIRFAuthorized=FALSE,
+            Decision="DIAGNOSTIC_ONLY__REVIEW_FOREIGN_STAR_REGION_SENSITIVITY",
+            stringsAsFactors=FALSE
+          )
+
+          write.csv(
+            decision,
+            file.path(out, "08_decision.csv"),
+            row.names=FALSE
+          )
+
+          # Parameter counts are exact by construction.
+          if (nrow(foreign_sep) != 54L) {
+            stop(
+              "Expected 54 foreign-star parameter/event combinations; found ",
+              nrow(foreign_sep)
+            )
+          }
+          if (nrow(gpr_sep) != 18L) {
+            stop(
+              "Expected 18 GPR parameter/event combinations; found ",
+              nrow(gpr_sep)
+            )
+          }
+
+          cat("\n================ 10j SG FOREIGN-TRANSMISSION AUDIT ================\n")
+          print(decision, row.names=FALSE)
+
+          cat("\nTop 15 foreign-star HIGH/LOW separations:\n")
+          print(
+            utils::head(
+              foreign_sep[
+                order(-foreign_sep$AbsSeparationOverWithinSD),
+                c(
+                  "Quarter", "Equation", "Term",
+                  "LowMean", "HighMean",
+                  "AbsSeparationOverWithinSD",
+                  "LowPrPositive", "HighPrPositive",
+                  "MeanSignFlip"
+                ),
+                drop=FALSE
+              ],
+              15
+            ),
+            row.names=FALSE
+          )
+
+          cat("\nIMPORTANT:\n")
+          cat("* 10j is a diagnostic-only workflow.\n")
+          cat("* No chain is dropped and no convergence threshold is weakened.\n")
+          cat("* A pooled failure is not converted into a pass by region labeling.\n")
+          cat("* Formal IRF remains unauthorized after this workflow.\n")
+          cat("===================================================================\n")
+          RS
+
+      - name: Upload 10j diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10j-sg-foreign-transmission-${{ github.run_id }}
+          path: results/10j_sg_foreign_transmission_audit
+          if-no-files-found: error
+          retention-days: 30
