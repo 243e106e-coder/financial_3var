@@ -1,0 +1,877 @@
+name: Financial 3var 10l Trade-W 14-country static-block SV formal validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Original Trade-W run containing exact validated input artifact"
+        required: true
+        default: "34056102906"
+        type: string
+
+      model_ref:
+        description: "Exact baseline statistical-model code SHA"
+        required: true
+        default: "710aea67d12ed8b38bdc2e275e27448241653299"
+        type: string
+
+      staticblock_ref:
+        description: "Exact commit containing the tested 10k-fixed static-block implementation"
+        required: true
+        default: "a2c9de6208b656850c11794087acc4ccaf56b6ff"
+        type: string
+
+      burn_per_chain:
+        description: "Burn-in per chain"
+        required: true
+        default: "12500"
+        type: string
+
+      postburn_per_chain:
+        description: "Internal post-burn MCMC iterations per chain"
+        required: true
+        default: "50000"
+        type: string
+
+      stored_per_chain:
+        description: "Strictly post-burn stored draws per chain"
+        required: true
+        default: "2000"
+        type: string
+
+      sv_inner_burnin:
+        description: "Conditional SV transitions inside each outer Gibbs iteration"
+        required: true
+        default: "4"
+        type: string
+
+      seed_base:
+        description: "Fresh independent seed base for 10l"
+        required: true
+        default: "20266191"
+        type: string
+
+      max_parallel:
+        description: "Maximum simultaneous country-chain jobs"
+        required: true
+        default: "14"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify_input:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+      MODEL_REF: ${{ inputs.model_ref }}
+      STATICBLOCK_REF: ${{ inputs.staticblock_ref }}
+      STATICBLOCK_WORKFLOW: ".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml"
+      STATICBLOCK_WORKFLOW_BLOB: "436875586a02ab3c2bfb4f90722a0ba1a4796b84"
+
+    steps:
+      - name: Checkout tested static-block implementation commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.staticblock_ref }}
+          fetch-depth: 0
+
+      - name: Verify implementation, baseline-model and input-artifact provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "${STATICBLOCK_REF}" || {
+            echo "::error::Checked-out SHA does not equal staticblock_ref."
+            exit 1
+          }
+
+          git cat-file -e "${MODEL_REF}^{commit}"
+
+          for f in \
+            R/00_config.R \
+            R/60_formal_bayesian_tvp_gvar.R \
+            R/61_formal_mcmc_diagnostics.R
+          do
+            test -f "${f}" || {
+              echo "::error::Missing ${f}"
+              exit 1
+            }
+            git diff --quiet "${MODEL_REF}" HEAD -- "${f}" || {
+              echo "::error::${f} differs between model_ref and staticblock_ref."
+              exit 1
+            }
+          done
+
+          test -f "${STATICBLOCK_WORKFLOW}"
+          test "$(git hash-object "${STATICBLOCK_WORKFLOW}")" = "${STATICBLOCK_WORKFLOW_BLOB}" || {
+            echo "::error::Tested 10k-fixed workflow blob differs from expected blob."
+            exit 1
+          }
+
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGINAL_RUN_ID}")"
+
+          test "$(jq -r '.status' <<<"${run_json}")" = "completed" || {
+            echo "::error::Original Trade-W run is not completed."
+            exit 1
+          }
+
+          test "$(jq -r '.path' <<<"${run_json}")" = \
+            ".github/workflows/10_trade_network_end_to_end.yml" || {
+            echo "::error::Unexpected original workflow path."
+            exit 1
+          }
+
+          artifact_name="financial-3var-10-trade-input-trade_2000_2012-${ORIGINAL_RUN_ID}"
+          n="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGINAL_RUN_ID}/artifacts?per_page=100" \
+              --jq \
+              "[.artifacts[] | select(.expired == false and .name == \"${artifact_name}\")] | length"
+          )"
+
+          test "${n}" = "1" || {
+            echo "::error::Expected exactly one unexpired Trade-W input artifact; found ${n}."
+            exit 1
+          }
+
+          python3 - <<'PY'
+          import os
+          b=int(os.environ.get("INPUT_BURN", "12500"))
+          k=int(os.environ.get("INPUT_KEEP", "50000"))
+          s=int(os.environ.get("INPUT_STORED", "2000"))
+          inner=int(os.environ.get("INPUT_INNER", "4"))
+          if b < 5000 or k < 10000 or s < 1000 or s >= k:
+              raise SystemExit("Invalid MCMC iteration contract")
+          if not 1 <= inner <= 20:
+              raise SystemExit("SV inner burn-in must be 1..20")
+          PY
+
+          echo "10L PROVENANCE AND INPUT INTEGRITY: PASS"
+        env:
+          INPUT_BURN: ${{ inputs.burn_per_chain }}
+          INPUT_KEEP: ${{ inputs.postburn_per_chain }}
+          INPUT_STORED: ${{ inputs.stored_per_chain }}
+          INPUT_INNER: ${{ inputs.sv_inner_burnin }}
+
+  estimate:
+    needs: verify_input
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        country: [AU, BR, CA, CH, CN, EA, UK, JP, KR, NO, SG, TR, US, ZA]
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_COUNTRY: ${{ matrix.country }}
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_TTVP_B1: "2"
+      FIN3_TTVP_B2: "1"
+      FIN3_TTVP_KAPPA0: "1e-4"
+      FIN3_SV_ON: "true"
+      FIN3_TVS_ON: "true"
+      FIN3_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+      MODEL_REF: ${{ inputs.model_ref }}
+      STATICBLOCK_REF: ${{ inputs.staticblock_ref }}
+      STATICBLOCK_WORKFLOW: ".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml"
+      STATICBLOCK_WORKFLOW_BLOB: "436875586a02ab3c2bfb4f90722a0ba1a4796b84"
+
+    steps:
+      - name: Checkout tested static-block implementation commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.staticblock_ref }}
+          fetch-depth: 0
+
+      - name: Verify exact implementation and baseline model contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "${STATICBLOCK_REF}"
+          git cat-file -e "${MODEL_REF}^{commit}"
+
+          for f in \
+            R/00_config.R \
+            R/60_formal_bayesian_tvp_gvar.R \
+            R/61_formal_mcmc_diagnostics.R
+          do
+            git diff --quiet "${MODEL_REF}" HEAD -- "${f}" || {
+              echo "::error::Baseline model file changed: ${f}"
+              exit 1
+            }
+          done
+
+          test "$(git hash-object "${STATICBLOCK_WORKFLOW}")" = "${STATICBLOCK_WORKFLOW_BLOB}"
+
+          case "${FIN3_COUNTRY}" in
+            AU|BR|CA|CH|CN|EA|UK|JP|KR|NO|SG|TR|US|ZA) ;;
+            *) echo "::error::Unexpected country ${FIN3_COUNTRY}"; exit 1 ;;
+          esac
+
+          test "${FIN3_NETWORK}" = "trade_2000_2012"
+          test "${FIN3_SV_ON}" = "true"
+          test "${FIN3_TVS_ON}" = "true"
+          test "${FIN3_TTVP_B1}" = "2"
+          test "${FIN3_TTVP_B2}" = "1"
+          test "${FIN3_TTVP_KAPPA0}" = "1e-4"
+
+          python3 - <<'PY'
+          import os
+          b=int(os.environ["FIN3_BURN"])
+          k=int(os.environ["FIN3_KEEP"])
+          s=int(os.environ["FIN3_STORED_PER_CHAIN"])
+          inner=int(os.environ["FIN3_SV_INNER_BURNIN"])
+          if b < 5000 or k < 10000 or s < 1000 or s >= k:
+              raise SystemExit("Invalid MCMC iteration contract")
+          if not 1 <= inner <= 20:
+              raise SystemExit("SV inner burn-in must be 1..20")
+          PY
+
+      - name: Download exact original Trade-W input
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify data and 10l statistical specification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+
+          echo "=============================================="
+          echo "10L UNIFORM STATIC-BLOCK + SV FORMAL SPEC"
+          echo "country=${FIN3_COUNTRY}"
+          echo "chain=${FIN3_CHAIN_ID}"
+          echo "network=${FIN3_NETWORK}"
+          echo "panel=${FIN3_FORMAL_PANEL}"
+          echo "TVS=${FIN3_TVS_ON}"
+          echo "SV=${FIN3_SV_ON}"
+          echo "static=r_star_0,de_star_0,deq_star_0"
+          echo "B1=${FIN3_TTVP_B1}"
+          echo "B2=${FIN3_TTVP_B2}"
+          echo "kappa0=${FIN3_TTVP_KAPPA0}"
+          echo "SV inner burnin=${FIN3_SV_INNER_BURNIN}"
+          echo "burn=${FIN3_BURN}"
+          echo "postburn=${FIN3_KEEP}"
+          echo "stored=${FIN3_STORED_PER_CHAIN}"
+          echo "seed_base=${FIN3_SEED_BASE}"
+          echo "=============================================="
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal TVP dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Extract exact tested 10k-fixed implementation scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          src = Path(".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml")
+          text = src.read_text().splitlines()
+
+          def extract_step(step_name, dst):
+              target = f"- name: {step_name}"
+              start = None
+              for i, line in enumerate(text):
+                  if line.strip() == target:
+                      start = i
+                      break
+              if start is None:
+                  raise SystemExit(f"Missing tested step: {step_name}")
+
+              run_line = None
+              for i in range(start + 1, len(text)):
+                  if text[i].startswith("      - name:"):
+                      break
+                  if text[i].strip() == "run: |":
+                      run_line = i
+                      break
+              if run_line is None:
+                  raise SystemExit(f"Missing run block for: {step_name}")
+
+              body = []
+              for i in range(run_line + 1, len(text)):
+                  line = text[i]
+                  if line.startswith("      - name:"):
+                      break
+                  if line.startswith("          "):
+                      body.append(line[10:])
+                  elif line.strip() == "":
+                      body.append("")
+                  else:
+                      raise SystemExit(
+                          f"Unexpected indentation while extracting {step_name}: {line!r}"
+                      )
+
+              if not body:
+                  raise SystemExit(f"Empty run block for: {step_name}")
+              Path(dst).write_text("\n".join(body) + "\n")
+
+          extract_step(
+              "Extend pinned threshtvp with static-block Gibbs sampler",
+              "/tmp/10l_extend_staticblock.sh"
+          )
+          extract_step(
+              "Build 10k-fixed estimator from baseline R/60",
+              "/tmp/10l_build_estimator.sh"
+          )
+          PY
+
+          bash -n /tmp/10l_extend_staticblock.sh
+          bash -n /tmp/10l_build_estimator.sh
+
+          echo "Exact tested 10k-fixed implementation scripts extracted."
+
+      - name: Install exact tested static-block sampler
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash /tmp/10l_extend_staticblock.sh
+
+      - name: Build exact tested static-block estimator
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash /tmp/10l_build_estimator.sh
+          test -f R/60_10k_fixed_staticblock_foreign0.R
+
+      - name: Record 10l specification audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          root="results/formal_tvp_parts/${FIN3_COUNTRY}/chain_${FIN3_CHAIN_ID}"
+          mkdir -p "${root}"
+
+          cat > "${root}/00_10l_specification_audit.csv" <<EOF
+          Country,Chain,BaselineModelSHA,StaticBlockImplementationSHA,StaticBlockWorkflowBlob,ThreshtvpSHA,Network,Panel,TVS,SV,StaticTerms,B1,B2,Kappa0,SVInnerBurnin,Burn,PostBurnInternal,StoredDraws,SeedBase
+          ${FIN3_COUNTRY},${FIN3_CHAIN_ID},${MODEL_REF},${STATICBLOCK_REF},${STATICBLOCK_WORKFLOW_BLOB},${FIN3_THRESHTVP_BASE_SHA},trade_2000_2012,panel_domestic_fin3_rate_diff.csv,TRUE,TRUE,"r_star_0;de_star_0;deq_star_0",2,1,1e-4,${FIN3_SV_INNER_BURNIN},${FIN3_BURN},${FIN3_KEEP},${FIN3_STORED_PER_CHAIN},${FIN3_SEED_BASE}
+          EOF
+
+      - name: Run 10l uniform static-block SV MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/60_10k_fixed_staticblock_foreign0.R
+
+      - name: Validate posterior and static-block contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          cc <- Sys.getenv("FIN3_COUNTRY")
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+          root <- file.path("results","formal_tvp_parts",cc,paste0("chain_",ch))
+          f <- list.files(
+            root,
+            pattern=paste0("^formal_tvp_",cc,"_chain",ch,"[.]rds$"),
+            full.names=TRUE
+          )
+          if (length(f)!=1L) stop("Expected exactly one posterior RDS")
+
+          z <- readRDS(f)
+          st <- c("r_star_0","de_star_0","deq_star_0")
+          eqs <- c("r","de","deq")
+
+          stopifnot(as.character(z$meta$country) == cc)
+          stopifnot(as.integer(z$meta$chain) == ch)
+          stopifnot(as.integer(z$meta$burn) == as.integer(Sys.getenv("FIN3_BURN")))
+          stopifnot(as.integer(z$meta$keep_internal) == as.integer(Sys.getenv("FIN3_KEEP")))
+          stopifnot(as.integer(z$meta$stored_draws) == as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN")))
+          stopifnot(isTRUE(z$meta$sv_on))
+          stopifnot(isTRUE(z$meta$tvs_on))
+          stopifnot(abs(as.numeric(z$meta$prior_B1)-2) < 1e-12)
+          stopifnot(abs(as.numeric(z$meta$prior_B2)-1) < 1e-12)
+          stopifnot(abs(as.numeric(z$meta$kappa0)-1e-4) < 1e-12)
+          stopifnot(basename(as.character(z$meta$source_panel)) == "panel_domestic_fin3_rate_diff.csv")
+          stopifnot(as.character(z$meta$main_network) == "trade_2000_2012")
+          stopifnot(z$meta$restriction_id == "STATIC_BLOCK_ALL_CONTEMPORANEOUS_FOREIGN_STAR")
+          stopifnot(identical(as.character(z$meta$static_terms),st))
+          stopifnot(as.integer(z$meta$sv_inner_burnin) == as.integer(Sys.getenv("FIN3_SV_INNER_BURNIN")))
+
+          detail <- list()
+          kk <- 0L
+          ok <- TRUE
+          for (eq in eqs) {
+            for (nm in st) {
+              p <- as.numeric(z$tv_probability[,nm,eq])
+              max_tv <- max(abs(p))
+              base <- as.numeric(z$event_coef[,1,eq,nm])
+              max_anchor_diff <- 0
+              for (a in seq_len(dim(z$event_coef)[2])) {
+                max_anchor_diff <- max(
+                  max_anchor_diff,
+                  max(abs(as.numeric(z$event_coef[,a,eq,nm])-base))
+                )
+              }
+              finite <- all(is.finite(base))
+              posterior_sd <- sd(base)
+              this_ok <- (
+                is.finite(max_tv) && max_tv <= 1e-14 &&
+                is.finite(max_anchor_diff) && max_anchor_diff <= 1e-8 &&
+                finite && is.finite(posterior_sd) && posterior_sd > 1e-12
+              )
+              ok <- ok && this_ok
+              kk <- kk + 1L
+              detail[[kk]] <- data.frame(
+                Country=cc,
+                Chain=ch,
+                Equation=eq,
+                StaticTerm=nm,
+                MaxAbsTVProbability=max_tv,
+                MaxAnchorDifference=max_anchor_diff,
+                PosteriorSD=posterior_sd,
+                Status=ifelse(this_ok,"PASS","FAIL"),
+                stringsAsFactors=FALSE
+              )
+            }
+          }
+          d <- do.call(rbind,detail)
+          write.csv(d,file.path(root,"07_static_block_contract.csv"),row.names=FALSE)
+
+          if (!ok) stop("10l static-block posterior contract failed")
+          cat("10L POSTERIOR + STATIC-BLOCK CONTRACT: PASS\n")
+          RS
+
+      - name: Build per-chain V0 numerical-degeneracy audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          cc <- Sys.getenv("FIN3_COUNTRY")
+          ch <- as.integer(Sys.getenv("FIN3_CHAIN_ID"))
+          root <- file.path("results","formal_tvp_parts",cc,paste0("chain_",ch))
+          f <- file.path(root,"02_chain_monitor_summary.csv")
+          if (!file.exists(f)) stop("Missing chain monitor summary: ",f)
+
+          x <- read.csv(f,stringsAsFactors=FALSE,check.names=FALSE)
+          need <- c("Parameter","Mean","SD")
+          if (!all(need %in% names(x))) stop("Unexpected chain-monitor schema")
+
+          v0 <- grepl("__V0__",x$Parameter,fixed=TRUE)
+          degenerate <- (
+            v0 & is.finite(x$Mean) & is.finite(x$SD) &
+            abs(x$Mean) < 1e-12 & x$SD < 1e-14
+          )
+
+          audit <- data.frame(
+            Country=cc,
+            Chain=ch,
+            MonitoredParameters=nrow(x),
+            V0Parameters=sum(v0),
+            DegenerateV0Parameters=sum(degenerate),
+            Status=ifelse(any(degenerate),"FAIL_DEGENERATE_V0","PASS"),
+            stringsAsFactors=FALSE
+          )
+          write.csv(audit,file.path(root,"05_chain_degeneracy_audit.csv"),row.names=FALSE)
+          if (any(degenerate)) {
+            write.csv(x[degenerate,,drop=FALSE],file.path(root,"06_degenerate_parameters.csv"),row.names=FALSE)
+            cat("::warning::Numerically degenerate V0 parameter(s) detected.\n")
+          } else {
+            cat("10L CHAIN DEGENERACY AUDIT: PASS\n")
+          }
+          RS
+
+      - name: Preserve tested implementation patches
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="results/formal_tvp_parts/${FIN3_COUNTRY}/chain_${FIN3_CHAIN_ID}"
+          mkdir -p "${root}"
+          for f in \
+            10k_fixed_threshtvp_staticblock.patch \
+            10k_fixed_estimator.patch \
+            R/60_10k_fixed_staticblock_foreign0.R
+          do
+            if test -f "${f}"; then
+              cp "${f}" "${root}/"
+            fi
+          done
+          cp /tmp/10l_extend_staticblock.sh "${root}/10l_extracted_extend_staticblock.sh" || true
+          cp /tmp/10l_build_estimator.sh "${root}/10l_extracted_build_estimator.sh" || true
+
+      - name: Upload 10l posterior part
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10l-staticblock-sv-trade_2000_2012-${{ matrix.country }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/formal_tvp_parts/${{ matrix.country }}/chain_${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  diagnose:
+    needs: [verify_input, estimate]
+    if: ${{ always() && needs.verify_input.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_PARTS_ROOT: "posterior_parts"
+      FIN3_NCHAINS: "4"
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_RHAT_TARGET: "1.01"
+      FIN3_RHAT_HARD: "1.05"
+      FIN3_ESS_TARGET: "400"
+      FIN3_ESS_HARD: "100"
+      FIN3_MIN_RHAT_TARGET_SHARE: "0.95"
+      FIN3_MIN_ESS_TARGET_SHARE: "0.90"
+      FIN3_EXPECTED_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_EXPECTED_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_EXPECTED_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+      MODEL_REF: ${{ inputs.model_ref }}
+      STATICBLOCK_REF: ${{ inputs.staticblock_ref }}
+
+    steps:
+      - name: Checkout tested static-block implementation commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.staticblock_ref }}
+          fetch-depth: 0
+
+      - name: Download all available 10l posterior parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10l-staticblock-sv-trade_2000_2012-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install formal convergence dependency
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Verify exact 14 x 4 10l posterior contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/10l_staticblock_sv_audit
+
+          Rscript --vanilla - <<'RS'
+          source("R/00_config.R")
+          out <- "results/10l_staticblock_sv_audit"
+          st <- c("r_star_0","de_star_0","deq_star_0")
+
+          files <- list.files(
+            "posterior_parts",
+            pattern="^formal_tvp_[A-Z]{2}_chain[1-4][.]rds$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+          if (length(files) != 56L)
+            stop("Expected exactly 56 posterior RDS files; found ",length(files))
+
+          idx <- do.call(rbind,lapply(files,function(f){
+            z <- readRDS(f)
+            data.frame(
+              Country=as.character(z$meta$country),
+              Chain=as.integer(z$meta$chain),
+              Burn=as.integer(z$meta$burn),
+              Keep=as.integer(z$meta$keep_internal),
+              Stored=as.integer(z$meta$stored_draws),
+              SV=isTRUE(z$meta$sv_on),
+              TVS=isTRUE(z$meta$tvs_on),
+              B1=as.numeric(z$meta$prior_B1),
+              B2=as.numeric(z$meta$prior_B2),
+              Kappa0=as.numeric(z$meta$kappa0),
+              Network=as.character(z$meta$main_network),
+              Panel=basename(as.character(z$meta$source_panel)),
+              Restriction=as.character(z$meta$restriction_id),
+              StaticTerms=paste(as.character(z$meta$static_terms),collapse=";"),
+              SVInnerBurnin=as.integer(z$meta$sv_inner_burnin),
+              File=f,
+              stringsAsFactors=FALSE
+            )
+          }))
+
+          key <- paste(idx$Country,idx$Chain,sep="||")
+          expected <- paste(
+            rep(COUNTRIES,each=4),
+            rep(1:4,times=length(COUNTRIES)),
+            sep="||"
+          )
+          if (anyDuplicated(key)) stop("Duplicate country-chain posterior")
+          if (!setequal(key,expected)) stop("Country-chain grid mismatch")
+
+          expected_burn <- as.integer(Sys.getenv("FIN3_EXPECTED_BURN"))
+          expected_keep <- as.integer(Sys.getenv("FIN3_EXPECTED_KEEP"))
+          expected_stored <- as.integer(Sys.getenv("FIN3_STORED_PER_CHAIN"))
+          expected_inner <- as.integer(Sys.getenv("FIN3_EXPECTED_SV_INNER_BURNIN"))
+
+          stopifnot(all(idx$Burn == expected_burn))
+          stopifnot(all(idx$Keep == expected_keep))
+          stopifnot(all(idx$Stored == expected_stored))
+          stopifnot(all(idx$SV))
+          stopifnot(all(idx$TVS))
+          stopifnot(all(abs(idx$B1-2) <= 1e-12))
+          stopifnot(all(abs(idx$B2-1) <= 1e-12))
+          stopifnot(all(abs(idx$Kappa0-1e-4) <= 1e-12))
+          stopifnot(all(idx$Network == "trade_2000_2012"))
+          stopifnot(all(idx$Panel == "panel_domestic_fin3_rate_diff.csv"))
+          stopifnot(all(idx$Restriction == "STATIC_BLOCK_ALL_CONTEMPORANEOUS_FOREIGN_STAR"))
+          stopifnot(all(idx$StaticTerms == paste(st,collapse=";")))
+          stopifnot(all(idx$SVInnerBurnin == expected_inner))
+
+          idx <- idx[order(match(idx$Country,COUNTRIES),idx$Chain),,drop=FALSE]
+          write.csv(idx,file.path(out,"00_posterior_contract.csv"),row.names=FALSE)
+
+          specification <- data.frame(
+            Item=c(
+              "Economies","ChainsPerEconomy","Network","Panel","TVS","SV",
+              "StaticTerms","B1","B2","Kappa0","SVInnerBurnin",
+              "BurnPerChain","PostBurnInternalPerChain","StoredDrawsPerChain",
+              "RhatTarget","RhatHard","ESSTarget","ESSHard",
+              "MinRhatTargetShare","MinESSTargetShare"
+            ),
+            Value=c(
+              length(COUNTRIES),4,"trade_2000_2012","panel_domestic_fin3_rate_diff.csv",
+              "TRUE","TRUE",paste(st,collapse=";"),"2","1","1e-4",expected_inner,
+              expected_burn,expected_keep,expected_stored,
+              Sys.getenv("FIN3_RHAT_TARGET"),Sys.getenv("FIN3_RHAT_HARD"),
+              Sys.getenv("FIN3_ESS_TARGET"),Sys.getenv("FIN3_ESS_HARD"),
+              Sys.getenv("FIN3_MIN_RHAT_TARGET_SHARE"),Sys.getenv("FIN3_MIN_ESS_TARGET_SHARE")
+            ),
+            stringsAsFactors=FALSE
+          )
+          write.csv(specification,file.path(out,"01_specification_contract.csv"),row.names=FALSE)
+          cat("10L 56-CHAIN POSTERIOR CONTRACT: PASS\n")
+          RS
+
+      - name: Aggregate numerical-degeneracy and static-block audits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          out <- "results/10l_staticblock_sv_audit"
+
+          degfs <- list.files(
+            "posterior_parts",
+            pattern="^05_chain_degeneracy_audit[.]csv$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+          if (length(degfs)!=56L)
+            stop("Expected 56 chain degeneracy audits; found ",length(degfs))
+          deg <- do.call(rbind,lapply(degfs,read.csv,stringsAsFactors=FALSE,check.names=FALSE))
+          deg <- deg[order(deg$Country,deg$Chain),,drop=FALSE]
+          write.csv(deg,file.path(out,"02_chain_degeneracy_audit.csv"),row.names=FALSE)
+
+          stfs <- list.files(
+            "posterior_parts",
+            pattern="^07_static_block_contract[.]csv$",
+            recursive=TRUE,
+            full.names=TRUE
+          )
+          if (length(stfs)!=56L)
+            stop("Expected 56 static-block contract files; found ",length(stfs))
+          st <- do.call(rbind,lapply(stfs,read.csv,stringsAsFactors=FALSE,check.names=FALSE))
+          st <- st[order(st$Country,st$Chain,st$Equation,st$StaticTerm),,drop=FALSE]
+          if (nrow(st)!=56L*9L)
+            stop("Expected 504 chain-equation-static-term checks; found ",nrow(st))
+          write.csv(st,file.path(out,"03_static_block_contract_audit.csv"),row.names=FALSE)
+
+          cat("Degenerate chains: ",sum(deg$Status!="PASS"),"\n",sep="")
+          cat("Static-block contract failures: ",sum(st$Status!="PASS"),"\n",sep="")
+          RS
+
+      - name: Build augmented formal diagnostics including static coefficients
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path("R/61_formal_mcmc_diagnostics.R")
+          dst=Path("R/61_10l_staticblock_mcmc_diagnostics.R")
+          s=src.read_text()
+          old='''    z <- readRDS(f)\n    as.matrix(z$monitor)\n'''
+          new='''    z <- readRDS(f)\n    m <- as.data.frame(as.matrix(z$monitor), check.names = FALSE)\n    static_terms <- c("r_star_0","de_star_0","deq_star_0")\n    static_eqs <- c("r","de","deq")\n    for (eq in static_eqs) {\n      for (nm in static_terms) {\n        new_name <- paste0(eq,"__static_coef__",nm)\n        if (new_name %in% names(m)) {\n          stopf("Duplicate static diagnostic name for %s: %s", cc, new_name)\n        }\n        v <- as.numeric(z$event_coef[,1,eq,nm])\n        if (length(v) != nrow(m)) {\n          stopf("Static coefficient draw count mismatch for %s: %s", cc, new_name)\n        }\n        m[[new_name]] <- v\n      }\n    }\n    as.matrix(m)\n'''
+          if s.count(old)!=1:
+              raise SystemExit("R/61 country-chain monitor block mismatch")
+          s=s.replace(old,new,1)
+          dst.write_text(s)
+          PY
+
+          Rscript --vanilla - <<'RS'
+          parse(file="R/61_10l_staticblock_mcmc_diagnostics.R")
+          cat("10l augmented formal diagnostics parse: PASS\n")
+          RS
+
+          diff -u R/61_formal_mcmc_diagnostics.R \
+            R/61_10l_staticblock_mcmc_diagnostics.R \
+            > results/10l_staticblock_sv_audit/04_formal_diagnostics_staticblock.patch || true
+          test -s results/10l_staticblock_sv_audit/04_formal_diagnostics_staticblock.patch
+
+      - name: Run formal 14-country MCMC diagnostics with static coefficients included
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/61_10l_staticblock_mcmc_diagnostics.R
+
+      - name: Audit 126 formal static-coefficient diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          out <- "results/10l_staticblock_sv_audit"
+          f <- "results/formal_tvp/01_mcmc_parameter_diagnostics.csv"
+          x <- read.csv(f,stringsAsFactors=FALSE,check.names=FALSE)
+          st <- x[grepl("__static_coef__",x$Parameter,fixed=TRUE),,drop=FALSE]
+          if (nrow(st)!=14L*9L)
+            stop("Expected 126 static coefficient diagnostics; found ",nrow(st))
+
+          active_finite <- st$Finite & !st$ConstantAcrossAllChains &
+            is.finite(st$Rhat) & is.finite(st$ESS_Bulk) & is.finite(st$ESS_Tail)
+          hard_fail <- (
+            !active_finite |
+            st$Rhat > as.numeric(Sys.getenv("FIN3_RHAT_HARD")) |
+            st$ESS_Bulk < as.numeric(Sys.getenv("FIN3_ESS_HARD")) |
+            st$ESS_Tail < as.numeric(Sys.getenv("FIN3_ESS_HARD"))
+          )
+          st$StaticDiagnosticReady <- !hard_fail
+          write.csv(st,file.path(out,"05_static_coefficient_formal_diagnostics.csv"),row.names=FALSE)
+          write.csv(st[hard_fail,,drop=FALSE],file.path(out,"06_static_coefficient_hard_fails.csv"),row.names=FALSE)
+
+          cat("Static diagnostics: ",nrow(st),"\n",sep="")
+          cat("Static hard failures: ",sum(hard_fail),"\n",sep="")
+          RS
+
+      - name: Build final 10l gate file before artifact upload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          out <- "results/10l_staticblock_sv_audit"
+          gate <- read.csv("results/formal_tvp/00_formal_mcmc_gate.csv",stringsAsFactors=FALSE,check.names=FALSE)
+          deg <- read.csv(file.path(out,"02_chain_degeneracy_audit.csv"),stringsAsFactors=FALSE,check.names=FALSE)
+          stc <- read.csv(file.path(out,"03_static_block_contract_audit.csv"),stringsAsFactors=FALSE,check.names=FALSE)
+          std <- read.csv(file.path(out,"05_static_coefficient_formal_diagnostics.csv"),stringsAsFactors=FALSE,check.names=FALSE)
+
+          if (nrow(gate)!=1L) stop("Malformed formal MCMC gate")
+
+          formal_ready <- gate$Status[1] == "READY_FOR_FORMAL_IRF"
+          numerical_ready <- nrow(deg)==56L && all(deg$Status=="PASS")
+          static_contract_ready <- nrow(stc)==504L && all(stc$Status=="PASS")
+          static_diag_ready <- nrow(std)==126L && all(std$StaticDiagnosticReady)
+
+          final <- data.frame(
+            FormalMCMCGate=gate$Status[1],
+            All56ChainDegeneracyAuditsPass=numerical_ready,
+            All56StaticBlockContractsPass=static_contract_ready,
+            StaticCoefficientDiagnostics=nrow(std),
+            StaticCoefficientHardFailCount=sum(!std$StaticDiagnosticReady),
+            All126StaticCoefficientDiagnosticsPassHardGate=static_diag_ready,
+            FinalStatus=ifelse(
+              formal_ready && numerical_ready && static_contract_ready && static_diag_ready,
+              "READY_FOR_FORMAL_IRF",
+              "FAIL"
+            ),
+            stringsAsFactors=FALSE
+          )
+          write.csv(final,file.path(out,"07_final_10l_gate.csv"),row.names=FALSE)
+          print(gate)
+          print(final)
+          RS
+
+      - name: Show formal convergence results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo
+          echo "================ 10L FORMAL MCMC GATE ================"
+          cat results/formal_tvp/00_formal_mcmc_gate.csv || true
+          echo
+          echo "================ COUNTRY SUMMARY ======================"
+          cat results/formal_tvp/02_mcmc_country_summary.csv || true
+          echo
+          echo "================ FINAL 10L GATE ======================="
+          cat results/10l_staticblock_sv_audit/07_final_10l_gate.csv || true
+          echo
+
+      - name: Upload 10l formal validation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10l-staticblock-sv-formal-validation-trade_2000_2012-${{ github.run_id }}
+          path: |
+            results/formal_tvp/
+            results/10l_staticblock_sv_audit/
+            R/61_10l_staticblock_mcmc_diagnostics.R
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce final 10l gate after artifact upload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          f <- "results/10l_staticblock_sv_audit/07_final_10l_gate.csv"
+          if (!file.exists(f))
+            stop("Final 10l gate file missing. Do NOT run IRF.")
+          x <- read.csv(f,stringsAsFactors=FALSE,check.names=FALSE)
+          if (nrow(x)!=1L) stop("Malformed final 10l gate file")
+          if (x$FinalStatus[1] != "READY_FOR_FORMAL_IRF") {
+            stop(
+              "10l 14-country uniform static-block SV validation failed. ",
+              "Do NOT run IRF, do NOT drop chains, and do NOT loosen thresholds."
+            )
+          }
+          cat("\n=====================================================\n")
+          cat("10L 14-COUNTRY STATIC-BLOCK + SV: READY_FOR_FORMAL_IRF\n")
+          cat("=====================================================\n")
+          RS
