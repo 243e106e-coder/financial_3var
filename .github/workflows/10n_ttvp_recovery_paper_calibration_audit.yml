@@ -1,0 +1,344 @@
+name: Financial 3var 10n TTVP recovery and JRSSA-2019 calibration audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Exact Trade-W prepared-input run"
+        required: true
+        default: "34056102906"
+        type: string
+      staticblock_ref:
+        description: "Exact tested 10k-fixed static-block implementation commit"
+        required: true
+        default: "a2c9de6208b656850c11794087acc4ccaf56b6ff"
+        type: string
+      burn_per_chain:
+        description: "Diagnostic burn-in per chain"
+        required: true
+        default: "5000"
+        type: string
+      postburn_per_chain:
+        description: "Diagnostic internal post-burn iterations"
+        required: true
+        default: "15000"
+        type: string
+      stored_per_chain:
+        description: "Strictly post-burn stored draws"
+        required: true
+        default: "1000"
+        type: string
+      sv_inner_burnin:
+        description: "Conditional SV transitions per outer Gibbs iteration"
+        required: true
+        default: "4"
+        type: string
+      seed_base:
+        description: "Fresh diagnostic seed base"
+        required: true
+        default: "20267001"
+        type: string
+      max_parallel:
+        description: "Maximum simultaneous diagnostic chain jobs"
+        required: true
+        default: "8"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  estimate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        scenario:
+          - REAL_JP__current_10l__static
+          - REAL_JP__paper_code__static
+          - REAL_JP__paper_code_wide__static
+          - REAL_SG__current_10l__static
+          - REAL_SG__paper_code__static
+          - REAL_SG__paper_code_wide__static
+          - REAL_TR__current_10l__static
+          - REAL_TR__paper_code__static
+          - REAL_TR__paper_code_wide__static
+          - SYNTH_JP__current_10l__static
+          - SYNTH_JP__paper_code__static
+          - SYNTH_JP__paper_code_wide__static
+          - SYNTH_JP__paper_code__unrestricted
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+      STATICBLOCK_REF: ${{ inputs.staticblock_ref }}
+      STATICBLOCK_WORKFLOW: ".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml"
+      STATICBLOCK_WORKFLOW_BLOB: "436875586a02ab3c2bfb4f90722a0ba1a4796b84"
+
+    steps:
+      - name: Checkout exact tested static-block implementation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.staticblock_ref }}
+          fetch-depth: 0
+
+      - name: Parse diagnostic scenario
+        shell: bash
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -euo pipefail
+
+          IFS='__' read -r CASE CALIB MODE <<< "${SCENARIO}"
+
+          case "${CASE}" in
+            REAL_JP|REAL_SG|REAL_TR|SYNTH_JP) ;;
+            *) echo "::error::Bad case ${CASE}"; exit 1 ;;
+          esac
+          case "${CALIB}" in
+            current_10l|paper_code|paper_code_wide) ;;
+            *) echo "::error::Bad calibration ${CALIB}"; exit 1 ;;
+          esac
+          case "${MODE}" in
+            static|unrestricted) ;;
+            *) echo "::error::Bad mode ${MODE}"; exit 1 ;;
+          esac
+
+          if [[ "${MODE}" == "unrestricted" ]] && \
+             [[ "${SCENARIO}" != "SYNTH_JP__paper_code__unrestricted" ]]; then
+            echo "::error::Unrestricted branch is synthetic paper_code only."
+            exit 1
+          fi
+
+          {
+            echo "FIN3_10N_CASE=${CASE}"
+            echo "FIN3_10N_CALIBRATION=${CALIB}"
+            echo "FIN3_10N_MODE=${MODE}"
+            echo "FIN3_10N_SCENARIO=${SCENARIO}"
+          } >> "${GITHUB_ENV}"
+
+          echo "scenario=${SCENARIO}"
+
+      - name: Verify exact implementation lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "${STATICBLOCK_REF}"
+          test -f R/00_config.R
+          test -f R/69_ttvp_recovery_chain.R
+          test -f R/70_ttvp_recovery_summarize.R
+          test -f "${STATICBLOCK_WORKFLOW}"
+
+          test "$(git hash-object "${STATICBLOCK_WORKFLOW}")" = \
+            "${STATICBLOCK_WORKFLOW_BLOB}" || {
+              echo "::error::10k-fixed workflow blob changed."
+              exit 1
+            }
+
+          python3 - <<'PY'
+          import os
+          b=int(os.environ["FIN3_BURN"])
+          k=int(os.environ["FIN3_KEEP"])
+          s=int(os.environ["FIN3_STORED_PER_CHAIN"])
+          inner=int(os.environ["FIN3_SV_INNER_BURNIN"])
+          if b < 1000 or k < 5000 or s < 500 or s >= k:
+              raise SystemExit("Invalid diagnostic iteration contract")
+          if not 1 <= inner <= 20:
+              raise SystemExit("Invalid SV inner burn-in")
+          PY
+
+      - name: Download exact accepted Trade-W prepared inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify exact model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install diagnostic dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Extract exact tested 10k-fixed sampler extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          src=Path(".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml")
+          text=src.read_text().splitlines()
+
+          target="- name: Extend pinned threshtvp with static-block Gibbs sampler"
+          start=None
+          for i,line in enumerate(text):
+              if line.strip()==target:
+                  start=i
+                  break
+          if start is None:
+              raise SystemExit("Missing tested static-block extension step")
+
+          run_line=None
+          for i in range(start+1,len(text)):
+              if text[i].startswith("      - name:"):
+                  break
+              if text[i].strip()=="run: |":
+                  run_line=i
+                  break
+          if run_line is None:
+              raise SystemExit("Missing tested static-block run block")
+
+          body=[]
+          for i in range(run_line+1,len(text)):
+              line=text[i]
+              if line.startswith("      - name:"):
+                  break
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif line.strip()=="":
+                  body.append("")
+              else:
+                  raise SystemExit(f"Unexpected indentation: {line!r}")
+
+          Path("/tmp/10n_extend_staticblock.sh").write_text(
+              "\n".join(body)+"\n"
+          )
+          PY
+
+          bash -n /tmp/10n_extend_staticblock.sh
+          bash /tmp/10n_extend_staticblock.sh
+
+      - name: Parse 10n R code before MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e 'parse(file="R/69_ttvp_recovery_chain.R")'
+          Rscript --vanilla -e 'parse(file="R/70_ttvp_recovery_summarize.R")'
+
+      - name: Run one 10n diagnostic chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/69_ttvp_recovery_chain.R
+
+      - name: Upload 10n chain part
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10n-${{ matrix.scenario }}-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/10n_ttvp_recovery_parts/${{ matrix.scenario }}/chain_${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  summarize:
+    needs: estimate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FIN3_10N_PARTS_ROOT: "posterior_parts"
+      FIN3_10N_SUMMARY_OUT: "results/10n_ttvp_recovery_audit"
+
+    steps:
+      - name: Checkout 10n summarizer
+        uses: actions/checkout@v4
+
+      - name: Download all 52 diagnostic chain artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10n-*-${{ github.run_id }}
+          path: posterior_parts
+          merge-multiple: false
+
+      - name: Verify 52 posterior RDS files
+        shell: bash
+        run: |
+          set -euo pipefail
+          n="$(find posterior_parts -type f -name '10n_chain.rds' | wc -l | tr -d ' ')"
+          test "${n}" = "52" || {
+            echo "::error::Expected 52 10n chain RDS files; found ${n}."
+            exit 1
+          }
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install posterior diagnostics
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Parse and run 10n summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e 'parse(file="R/70_ttvp_recovery_summarize.R")'
+          Rscript --vanilla R/70_ttvp_recovery_summarize.R
+
+          echo
+          echo "===== 10N DECISION ====="
+          cat results/10n_ttvp_recovery_audit/09_decision.csv
+
+      - name: Upload 10n diagnostic summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10n-ttvp-recovery-audit-${{ github.run_id }}
+          path: results/10n_ttvp_recovery_audit/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce technical integrity only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          p="results/10n_ttvp_recovery_audit/09_decision.csv"
+          rows={r["Item"]:r["Value"] for r in csv.DictReader(open(p))}
+          if rows.get("TechnicalStatus")!="PASS":
+              raise SystemExit("10n technical status is not PASS")
+          print("10N TECHNICAL INTEGRITY: PASS")
+          print("Scientific decision:",rows.get("Decision"))
+          print("Formal model changed:",rows.get("FormalModelChanged"))
+          print("IRF authorized:",rows.get("IRFAuthorized"))
+          PY
