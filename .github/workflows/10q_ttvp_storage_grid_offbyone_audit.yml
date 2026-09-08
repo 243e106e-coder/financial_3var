@@ -1,0 +1,95 @@
+name: Financial 3var 10q threshtvp storage-grid off-by-one audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+
+    steps:
+      - name: Checkout current diagnostic code
+        uses: actions/checkout@v4
+
+      - name: Verify 10q diagnostic exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f R/73_ttvp_storage_grid_offbyone_audit.R
+          grep -F '10p_short' R/73_ttvp_storage_grid_offbyone_audit.R >/dev/null
+          grep -F '10o_long' R/73_ttvp_storage_grid_offbyone_audit.R >/dev/null
+          grep -F 'FormalModelChanged' R/73_ttvp_storage_grid_offbyone_audit.R >/dev/null
+          grep -F 'IRFAuthorized' R/73_ttvp_storage_grid_offbyone_audit.R >/dev/null
+
+      - name: Verify exact pinned source expressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/threshtvp_10q
+          git clone -q https://github.com/gregorkastner/threshtvp.git /tmp/threshtvp_10q
+          git -C /tmp/threshtvp_10q checkout -q --detach "${FIN3_THRESHTVP_BASE_SHA}"
+          test "$(git -C /tmp/threshtvp_10q rev-parse HEAD)" = "${FIN3_THRESHTVP_BASE_SHA}"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path("/tmp/threshtvp_10q/R/MCMC_function.R")
+          s=p.read_text()
+
+          required=[
+              "thin_out <- round(seq(nburn,ntot,length.out = thin*nsave))",
+              "H_store <- matrix(NA,thin*nsave,T)",
+              "ALPHA_store <- array(NA,c(thin*nsave,T,K_))",
+              "if (irep %in% thin_out){",
+              "ithin <- ithin+1",
+              "H_store[ithin,] <- hv",
+              "ALPHA_store[ithin,,] <- t(ALPHA)",
+          ]
+
+          missing=[x for x in required if x not in s]
+          if missing:
+              raise SystemExit("Pinned source contract changed/missing: "+repr(missing))
+
+          print("Pinned MCMC_tvp storage expressions: VERIFIED")
+          PY
+
+      - name: Set up R 4.4.2
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Parse 10q R code
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e 'parse(file="R/73_ttvp_storage_grid_offbyone_audit.R")'
+
+      - name: Run exact storage arithmetic audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/73_ttvp_storage_grid_offbyone_audit.R
+
+      - name: Show decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat results/10q_storage_grid_audit/01_storage_contract_comparison.csv
+          echo
+          cat results/10q_storage_grid_audit/02_decision.csv
+
+      - name: Upload 10q storage audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10q-storage-grid-audit-${{ github.run_id }}
+          path: results/10q_storage_grid_audit/
+          if-no-files-found: error
+          retention-days: 30
