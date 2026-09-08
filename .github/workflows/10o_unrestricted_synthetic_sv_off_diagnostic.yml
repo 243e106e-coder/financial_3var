@@ -1,0 +1,333 @@
+name: Financial 3var 10o unrestricted synthetic SV-off diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Exact Trade-W prepared-input run"
+        required: true
+        default: "34056102906"
+        type: string
+      staticblock_ref:
+        description: "Exact tested 10k-fixed implementation commit used to reconstruct the pinned threshtvp environment"
+        required: true
+        default: "a2c9de6208b656850c11794087acc4ccaf56b6ff"
+        type: string
+      burn_per_chain:
+        description: "Diagnostic burn-in per chain"
+        required: true
+        default: "5000"
+        type: string
+      postburn_per_chain:
+        description: "Diagnostic internal post-burn iterations"
+        required: true
+        default: "15000"
+        type: string
+      stored_per_chain:
+        description: "Requested stored draws"
+        required: true
+        default: "1000"
+        type: string
+      sv_inner_burnin:
+        description: "Retained for call parity with 10n; irrelevant when SV=FALSE"
+        required: true
+        default: "4"
+        type: string
+      seed_base:
+        description: "Same seed base as 10n"
+        required: true
+        default: "20267001"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sv_off:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_10N_CASE: "SYNTH_JP"
+      FIN3_10N_CALIBRATION: "paper_code"
+      FIN3_10N_MODE: "unrestricted"
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+      STATICBLOCK_REF: ${{ inputs.staticblock_ref }}
+      STATICBLOCK_WORKFLOW: ".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml"
+      STATICBLOCK_WORKFLOW_BLOB: "436875586a02ab3c2bfb4f90722a0ba1a4796b84"
+
+    steps:
+      - name: Checkout current 10o code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify diagnostic hard locks and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f R/00_config.R
+          test -f R/71_ttvp_unrestricted_sv_off_diagnostic.R
+          test -f "${STATICBLOCK_WORKFLOW}"
+
+          git cat-file -e "${STATICBLOCK_REF}^{commit}"
+
+          test "$(git hash-object "${STATICBLOCK_WORKFLOW}")" = \
+            "${STATICBLOCK_WORKFLOW_BLOB}" || {
+              echo "::error::10k-fixed workflow blob changed."
+              exit 1
+            }
+
+          grep -F 'sv_on = FALSE' R/71_ttvp_unrestricted_sv_off_diagnostic.R >/dev/null
+          grep -F 'FIN3_10N_CASE=SYNTH_JP' R/71_ttvp_unrestricted_sv_off_diagnostic.R >/dev/null
+          grep -F 'FIN3_10N_CALIBRATION=paper_code' R/71_ttvp_unrestricted_sv_off_diagnostic.R >/dev/null
+          grep -F 'FIN3_10N_MODE=unrestricted' R/71_ttvp_unrestricted_sv_off_diagnostic.R >/dev/null
+          grep -F 'FormalModelChanged=FALSE' R/71_ttvp_unrestricted_sv_off_diagnostic.R >/dev/null
+          grep -F 'IRFAuthorized=FALSE' R/71_ttvp_unrestricted_sv_off_diagnostic.R >/dev/null
+
+      - name: Download exact accepted Trade-W prepared inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify exact model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install diagnostic dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Reconstruct exact tested pinned threshtvp environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          src=Path(".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml")
+          lines=src.read_text().splitlines()
+
+          target="- name: Extend pinned threshtvp with static-block Gibbs sampler"
+          start=next((i for i,x in enumerate(lines) if x.strip()==target),None)
+          if start is None:
+              raise SystemExit("Missing tested extension step")
+
+          run_line=None
+          for i in range(start+1,len(lines)):
+              if lines[i].startswith("      - name:"):
+                  break
+              if lines[i].strip()=="run: |":
+                  run_line=i
+                  break
+          if run_line is None:
+              raise SystemExit("Missing tested extension run block")
+
+          body=[]
+          for i in range(run_line+1,len(lines)):
+              line=lines[i]
+              if line.startswith("      - name:"):
+                  break
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append("")
+              else:
+                  raise SystemExit(f"Unexpected indentation: {line!r}")
+
+          Path("/tmp/10o_extend_staticblock.sh").write_text(
+              "\n".join(body)+"\n"
+          )
+          PY
+
+          bash -n /tmp/10o_extend_staticblock.sh
+          bash /tmp/10o_extend_staticblock.sh
+
+      - name: Parse 10o R code
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e 'parse(file="R/71_ttvp_unrestricted_sv_off_diagnostic.R")'
+
+      - name: Run one SV-off unrestricted synthetic chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/71_ttvp_unrestricted_sv_off_diagnostic.R
+
+      - name: Verify diagnostic status exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="results/10o_unrestricted_sv_off/chain_${FIN3_CHAIN_ID}"
+          test -f "${out}/00_status.csv"
+          cat "${out}/00_status.csv"
+
+      - name: Upload SV-off chain diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10o-sv-off-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: results/10o_unrestricted_sv_off/chain_${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  summarize:
+    needs: sv_off
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Download all available SV-off chain diagnostics
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10o-sv-off-chain*-${{ github.run_id }}
+          path: chain_artifacts
+          merge-multiple: false
+
+      - name: Summarize four-chain numerical diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/10o_unrestricted_sv_off_summary
+
+          python3 - <<'PY'
+          import csv, glob, os, math
+
+          files=sorted(glob.glob("chain_artifacts/**/00_status.csv",recursive=True))
+          if len(files)!=4:
+              raise SystemExit(f"Expected four 00_status.csv files, found {len(files)}")
+
+          rows=[]
+          for f in files:
+              with open(f,newline="") as h:
+                  r=list(csv.DictReader(h))
+              if len(r)!=1:
+                  raise SystemExit(f"Expected one row in {f}")
+              rows.append(r[0])
+
+          rows.sort(key=lambda r:int(r["Chain"]))
+
+          out="results/10o_unrestricted_sv_off_summary/01_chain_status.csv"
+          with open(out,"w",newline="") as h:
+              w=csv.DictWriter(h,fieldnames=rows[0].keys())
+              w.writeheader()
+              w.writerows(rows)
+
+          completed=[r["SamplerCompleted"].strip().upper()=="TRUE" for r in rows]
+          errors=[r.get("ErrorMessage","") for r in rows]
+
+          sig_high=[
+              ("SigHigh" in e and "chol" in e)
+              for e in errors
+          ]
+
+          if all(completed):
+              decision=(
+                  "SV_OFF_ALL_4_CHAINS_COMPLETE__KNOWN_SV_ON_CHOL_FAILURE_"
+                  "IS_CONSISTENT_WITH_AN_SV_INTERACTION"
+              )
+          elif not any(completed) and all(sig_high):
+              decision=(
+                  "SIGHigh_CHOL_FAILURE_PERSISTS_WITH_SV_OFF__"
+                  "NOT_SPECIFIC_TO_STOCHASTIC_VOLATILITY"
+              )
+          elif any(completed):
+              decision=(
+                  "SV_OFF_CHAIN_DEPENDENT_NUMERICAL_INSTABILITY__"
+                  "UNRESTRICTED_SAMPLER_REQUIRES_FURTHER_AUDIT"
+              )
+          else:
+              decision=(
+                  "SV_OFF_ALL_CHAINS_FAIL_WITH_OTHER_ERRORS__"
+                  "INSPECT_CHAIN_STATUS_BEFORE_ANY_MODEL_CHANGE"
+              )
+
+          # Collect recovery summaries when the sampler completed.
+          rec_files=sorted(glob.glob(
+              "chain_artifacts/**/03_recovery_summary.csv",
+              recursive=True
+          ))
+          rec=[]
+          for f in rec_files:
+              with open(f,newline="") as h:
+                  rec.extend(csv.DictReader(h))
+
+          if rec:
+              rout="results/10o_unrestricted_sv_off_summary/02_recovery_summary.csv"
+              fields=list(rec[0].keys())
+              with open(rout,"w",newline="") as h:
+                  w=csv.DictWriter(h,fieldnames=fields)
+                  w.writeheader()
+                  w.writerows(rec)
+
+          decision_rows=[
+              ("TechnicalStatus","PASS"),
+              ("ChainsExpected","4"),
+              ("ChainsWithStatus",str(len(rows))),
+              ("SamplerCompletedCount",str(sum(completed))),
+              ("SigHighCholFailureCount",str(sum(sig_high))),
+              ("Decision",decision),
+              ("FormalModelChanged","FALSE"),
+              ("IRFAuthorized","FALSE"),
+          ]
+
+          with open(
+              "results/10o_unrestricted_sv_off_summary/03_decision.csv",
+              "w",newline=""
+          ) as h:
+              w=csv.writer(h)
+              w.writerow(["Item","Value"])
+              w.writerows(decision_rows)
+
+          print("===== 10o DECISION =====")
+          for k,v in decision_rows:
+              print(f"{k}: {v}")
+          PY
+
+      - name: Upload 10o diagnostic summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10o-unrestricted-sv-off-summary-${{ github.run_id }}
+          path: results/10o_unrestricted_sv_off_summary/
+          if-no-files-found: error
+          retention-days: 30
