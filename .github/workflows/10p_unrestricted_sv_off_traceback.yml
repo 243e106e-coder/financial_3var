@@ -1,0 +1,332 @@
+name: Financial 3var 10p unrestricted SV-off traceback
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_run_id:
+        description: "Exact Trade-W prepared-input run"
+        required: true
+        default: "34056102906"
+        type: string
+      burn:
+        description: "Short diagnostic burn-in"
+        required: true
+        default: "1000"
+        type: string
+      save:
+        description: "Short diagnostic post-burn iterations"
+        required: true
+        default: "3000"
+        type: string
+      stored:
+        description: "Requested short diagnostic stored draws"
+        required: true
+        default: "300"
+        type: string
+      seed:
+        description: "Single diagnostic seed"
+        required: true
+        default: "20268001"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  traceback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        implementation:
+          - pristine_direct
+          - extended_direct
+          - extended_wrapper
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_10P_IMPLEMENTATION: ${{ matrix.implementation }}
+      FIN3_10P_BURN: ${{ inputs.burn }}
+      FIN3_10P_SAVE: ${{ inputs.save }}
+      FIN3_10P_STORED: ${{ inputs.stored }}
+      FIN3_10P_SEED: ${{ inputs.seed }}
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+      STATICBLOCK_WORKFLOW: ".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml"
+      STATICBLOCK_WORKFLOW_BLOB: "436875586a02ab3c2bfb4f90722a0ba1a4796b84"
+
+    steps:
+      - name: Checkout current diagnostic code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify 10p hard locks
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f R/00_config.R
+          test -f R/72_ttvp_unrestricted_sv_off_traceback.R
+          test -f "${STATICBLOCK_WORKFLOW}"
+          test "$(git hash-object "${STATICBLOCK_WORKFLOW}")" = \
+            "${STATICBLOCK_WORKFLOW_BLOB}" || {
+              echo "::error::10k-fixed workflow blob changed"
+              exit 1
+            }
+          grep -F 'FormalModelChanged=FALSE' R/72_ttvp_unrestricted_sv_off_traceback.R >/dev/null
+          grep -F 'IRFAuthorized=FALSE' R/72_ttvp_unrestricted_sv_off_traceback.R >/dev/null
+          grep -F 'sv_on=FALSE' R/72_ttvp_unrestricted_sv_off_traceback.R >/dev/null
+          grep -F 'B_1=3, B_2=0.03, kappa0=-0.005' R/72_ttvp_unrestricted_sv_off_traceback.R >/dev/null
+
+      - name: Download exact accepted Trade-W prepared inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify exact input files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install diagnostic dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Install pinned threshtvp implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${FIN3_10P_IMPLEMENTATION}" = "pristine_direct" ]; then
+            rm -rf threshtvp_src
+            git clone https://github.com/gregorkastner/threshtvp.git threshtvp_src
+            git -C threshtvp_src checkout --detach "${FIN3_THRESHTVP_BASE_SHA}"
+            test "$(git -C threshtvp_src rev-parse HEAD)" = "${FIN3_THRESHTVP_BASE_SHA}"
+            find threshtvp_src/src -maxdepth 1 -type f \
+              \( -name '*.o' -o -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+              -delete
+            R CMD INSTALL --preclean --clean --no-multiarch \
+              --with-keep.source threshtvp_src
+          else
+            python3 - <<'PY'
+          from pathlib import Path
+
+          src=Path(".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml")
+          lines=src.read_text().splitlines()
+          target="- name: Extend pinned threshtvp with static-block Gibbs sampler"
+          start=next((i for i,x in enumerate(lines) if x.strip()==target),None)
+          if start is None:
+              raise SystemExit("Missing tested static-block extension step")
+
+          run_line=None
+          for i in range(start+1,len(lines)):
+              if lines[i].startswith("      - name:"):
+                  break
+              if lines[i].strip()=="run: |":
+                  run_line=i
+                  break
+          if run_line is None:
+              raise SystemExit("Missing tested extension run block")
+
+          body=[]
+          for i in range(run_line+1,len(lines)):
+              line=lines[i]
+              if line.startswith("      - name:"):
+                  break
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append("")
+              else:
+                  raise SystemExit(f"Unexpected indentation: {line!r}")
+
+          Path("/tmp/10p_extend_staticblock.sh").write_text("\n".join(body)+"\n")
+          PY
+            bash -n /tmp/10p_extend_staticblock.sh
+            bash /tmp/10p_extend_staticblock.sh
+          fi
+
+          Rscript --vanilla - <<'RS'
+          stopifnot(requireNamespace("threshtvp",quietly=TRUE))
+          f <- getFromNamespace("MCMC_tvp","threshtvp")
+          cat("MCMC_tvp formals:\n")
+          print(formals(f))
+          cat("estimate_tvp formals:\n")
+          print(formals(getFromNamespace("estimate_tvp","threshtvp")))
+          capture.output(f, file="/tmp/MCMC_tvp_deparse.txt")
+          RS
+          sha256sum /tmp/MCMC_tvp_deparse.txt | tee /tmp/MCMC_tvp_deparse.sha256
+
+      - name: Parse 10p R code
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e 'parse(file="R/72_ttvp_unrestricted_sv_off_traceback.R")'
+
+      - name: Run short traceback diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "results/10p_traceback/${FIN3_10P_IMPLEMENTATION}"
+          cp /tmp/MCMC_tvp_deparse.sha256 \
+            "results/10p_traceback/${FIN3_10P_IMPLEMENTATION}/00_mcmc_function.sha256"
+          Rscript --vanilla R/72_ttvp_unrestricted_sv_off_traceback.R 2>&1 | \
+            tee "results/10p_traceback/${FIN3_10P_IMPLEMENTATION}/06_console.log"
+
+      - name: Show diagnostic status and traceback
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          root="results/10p_traceback/${FIN3_10P_IMPLEMENTATION}"
+          echo "===== STATUS ====="
+          cat "${root}/01_status.csv" 2>/dev/null || true
+          echo "===== PRE-UNWIND CALL STACK ====="
+          cat "${root}/02_call_stack_pre_unwind.txt" 2>/dev/null || true
+          echo "===== DEEPEST SAMPLER FRAME ====="
+          cat "${root}/04_deepest_sampler_frame.csv" 2>/dev/null || true
+
+      - name: Upload 10p traceback artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10p-${{ matrix.implementation }}-${{ github.run_id }}
+          path: results/10p_traceback/${{ matrix.implementation }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  summarize:
+    needs: traceback
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Download all 10p traceback artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10p-*-${{ github.run_id }}
+          path: parts
+          merge-multiple: false
+
+      - name: Build 10p decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/10p_summary
+          python3 - <<'PY'
+          import csv, glob, os
+
+          files=sorted(glob.glob("parts/**/01_status.csv",recursive=True))
+          if len(files)!=3:
+              raise SystemExit(f"Expected 3 status files, found {len(files)}")
+
+          rows=[]
+          for f in files:
+              with open(f,newline="") as h:
+                  rr=list(csv.DictReader(h))
+              if len(rr)!=1:
+                  raise SystemExit(f"Expected one status row in {f}")
+              rows.append(rr[0])
+
+          rows.sort(key=lambda r:r["Implementation"])
+          with open("results/10p_summary/01_status_by_implementation.csv","w",newline="") as h:
+              w=csv.DictWriter(h,fieldnames=rows[0].keys())
+              w.writeheader()
+              w.writerows(rows)
+
+          by={r["Implementation"]:r for r in rows}
+          def complete(name):
+              return by[name]["SamplerCompleted"].strip().upper()=="TRUE"
+          def oob(name):
+              return "subscript out of bounds" in by[name].get("ErrorMessage","").lower()
+
+          pd=complete("pristine_direct")
+          ed=complete("extended_direct")
+          ew=complete("extended_wrapper")
+          po=oob("pristine_direct")
+          eo=oob("extended_direct")
+          wo=oob("extended_wrapper")
+
+          if po and eo:
+              decision="ORIGINAL_MCMC_TVP_SV_OFF_PATH_REPRODUCES_OUT_OF_BOUNDS"
+          elif pd and ed and wo:
+              decision="EXTENDED_ESTIMATE_TVP_WRAPPER_PATH_CAUSES_OUT_OF_BOUNDS"
+          elif pd and (not ed):
+              decision="STATICBLOCK_EXTENSION_CHANGES_DIRECT_MCMC_BEHAVIOR__INSPECT"
+          elif pd and ed and ew:
+              decision="SHORT_TRACE_RUN_DID_NOT_REPRODUCE__INCREASE_ITERATIONS"
+          else:
+              decision="MIXED_10P_RESULT__INSPECT_TRACEBACK_ARTIFACTS"
+
+          hashes={}
+          for f in glob.glob("parts/**/00_mcmc_function.sha256",recursive=True):
+              impl=os.path.basename(os.path.dirname(f))
+              # dirname is artifact inner root in merge-multiple=false layout;
+              # recover implementation from parent artifact name when possible.
+              with open(f) as h:
+                  txt=h.read().strip().split()
+              if txt:
+                  hashes[f]=txt[0]
+
+          decision_rows=[
+              ("TechnicalStatus","PASS"),
+              ("PristineDirectCompleted",str(pd).upper()),
+              ("ExtendedDirectCompleted",str(ed).upper()),
+              ("ExtendedWrapperCompleted",str(ew).upper()),
+              ("PristineDirectOutOfBounds",str(po).upper()),
+              ("ExtendedDirectOutOfBounds",str(eo).upper()),
+              ("ExtendedWrapperOutOfBounds",str(wo).upper()),
+              ("Decision",decision),
+              ("FormalModelChanged","FALSE"),
+              ("IRFAuthorized","FALSE"),
+          ]
+          with open("results/10p_summary/02_decision.csv","w",newline="") as h:
+              w=csv.writer(h)
+              w.writerow(["Item","Value"])
+              w.writerows(decision_rows)
+
+          # Copy text tracebacks into summary for convenient inspection.
+          for f in glob.glob("parts/**/02_call_stack_pre_unwind.txt",recursive=True):
+              parent=os.path.basename(os.path.dirname(f))
+              # use a collision-safe name from artifact directory path
+              key=os.path.basename(os.path.dirname(os.path.dirname(f)))
+              out=f"results/10p_summary/trace_{key}_{parent}.txt"
+              with open(f) as src, open(out,"w") as dst:
+                  dst.write(src.read())
+
+          print("===== 10p DECISION =====")
+          for k,v in decision_rows:
+              print(f"{k}: {v}")
+          PY
+
+      - name: Upload 10p summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10p-traceback-summary-${{ github.run_id }}
+          path: results/10p_summary/
+          if-no-files-found: error
+          retention-days: 30
