@@ -1,0 +1,488 @@
+name: Financial 3var 10r storage-fixed unrestricted recovery and 10n decision
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_static_run_id:
+        description: "10n run containing the completed 48 static chain artifacts"
+        required: true
+        default: "34170937878"
+        type: string
+      source_static_head_sha:
+        description: "HEAD SHA of the completed 48-static run"
+        required: true
+        default: "b4723e8ce730a65e895b3908cd320e1c085d9b38"
+        type: string
+      original_run_id:
+        description: "Exact Trade-W prepared-input run"
+        required: true
+        default: "34056102906"
+        type: string
+      staticblock_ref:
+        description: "Exact tested 10k-fixed static-block implementation commit"
+        required: true
+        default: "a2c9de6208b656850c11794087acc4ccaf56b6ff"
+        type: string
+      burn_per_chain:
+        description: "10n diagnostic burn-in; unchanged"
+        required: true
+        default: "5000"
+        type: string
+      postburn_per_chain:
+        description: "10n internal post-burn iterations; unchanged"
+        required: true
+        default: "15000"
+        type: string
+      stored_per_chain:
+        description: "Strictly post-burn stored draws; unchanged"
+        required: true
+        default: "1000"
+        type: string
+      sv_inner_burnin:
+        description: "Conditional SV transitions; unchanged"
+        required: true
+        default: "4"
+        type: string
+      seed_base:
+        description: "Original 10n seed base; unchanged"
+        required: true
+        default: "20267001"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  unrestricted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        chain: [1, 2, 3, 4]
+
+    env:
+      FIN3_NETWORK: "trade_2000_2012"
+      FIN3_10N_CASE: "SYNTH_JP"
+      FIN3_10N_CALIBRATION: "paper_code"
+      FIN3_10N_MODE: "unrestricted"
+      FIN3_10N_SCENARIO: "SYNTH_JP__paper_code__unrestricted"
+      FIN3_CHAIN_ID: ${{ matrix.chain }}
+      FIN3_BURN: ${{ inputs.burn_per_chain }}
+      FIN3_KEEP: ${{ inputs.postburn_per_chain }}
+      FIN3_STORED_PER_CHAIN: ${{ inputs.stored_per_chain }}
+      FIN3_SEED_BASE: ${{ inputs.seed_base }}
+      FIN3_SV_INNER_BURNIN: ${{ inputs.sv_inner_burnin }}
+      FIN3_FORMAL_PANEL: "data/derived/panel_domestic_fin3_rate_diff.csv"
+      FIN3_THRESHTVP_BASE_SHA: "c0133f262fcf0f935805168f8b7def02b43dc6d5"
+      STATICBLOCK_REF: ${{ inputs.staticblock_ref }}
+      STATICBLOCK_WORKFLOW: ".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml"
+      STATICBLOCK_WORKFLOW_BLOB: "436875586a02ab3c2bfb4f90722a0ba1a4796b84"
+      FIN3_10R_PATCH_MANIFEST: "results/10r_storage_patch_manifest.csv"
+
+    steps:
+      - name: Checkout current 10r code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify 10r code and unchanged statistical contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f R/00_config.R
+          test -f R/69_ttvp_recovery_chain.R
+          test -f R/70_ttvp_recovery_summarize.R
+          test -f R/74_patch_threshtvp_storage_grid.R
+          test -f "${STATICBLOCK_WORKFLOW}"
+
+          git cat-file -e "${STATICBLOCK_REF}^{commit}"
+          test "$(git hash-object "${STATICBLOCK_WORKFLOW}")" = \
+            "${STATICBLOCK_WORKFLOW_BLOB}" || {
+              echo "::error::10k-fixed workflow provenance changed."
+              exit 1
+            }
+
+          grep -F 'Storage-fixed unrestricted expected exactly' \
+            R/69_ttvp_recovery_chain.R >/dev/null
+          grep -F 'candidates <- seq.int(2L, nstored_raw)' \
+            R/69_ttvp_recovery_chain.R >/dev/null
+          grep -F 'nstore <- as.integer(round(thin*nsave))' \
+            R/74_patch_threshtvp_storage_grid.R >/dev/null
+          grep -F 'StatisticalModelChanged' \
+            R/74_patch_threshtvp_storage_grid.R >/dev/null
+
+          python3 - <<'PY'
+          import os
+          b=int(os.environ["FIN3_BURN"])
+          k=int(os.environ["FIN3_KEEP"])
+          s=int(os.environ["FIN3_STORED_PER_CHAIN"])
+          inner=int(os.environ["FIN3_SV_INNER_BURNIN"])
+          if (b,k,s,inner)!=(5000,15000,1000,4):
+              raise SystemExit(
+                  f"10r must preserve 10n iteration contract; got {(b,k,s,inner)}"
+              )
+          PY
+
+      - name: Verify source 48-static artifact contract
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC_RUN: ${{ inputs.source_static_run_id }}
+          SRC_SHA: ${{ inputs.source_static_head_sha }}
+        run: |
+          set -euo pipefail
+
+          actual_sha="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SRC_RUN}" \
+            --jq '.head_sha')"
+          test "${actual_sha}" = "${SRC_SHA}" || {
+            echo "::error::Source run HEAD mismatch: ${actual_sha} != ${SRC_SHA}"
+            exit 1
+          }
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SRC_RUN}/artifacts?per_page=100" \
+            > /tmp/source_artifacts.json
+
+          python3 - <<'PY'
+          import json
+          x=json.load(open("/tmp/source_artifacts.json"))
+          arts=[a for a in x.get("artifacts",[]) if not a.get("expired",False)]
+          if len(arts)!=48:
+              raise SystemExit(
+                  f"Expected exactly 48 live static artifacts, found {len(arts)}"
+              )
+          names=[a["name"] for a in arts]
+          if any("__unrestricted" in n for n in names):
+              raise SystemExit("Source run unexpectedly contains unrestricted artifact")
+          if not all("__static-chain" in n for n in names):
+              bad=[n for n in names if "__static-chain" not in n]
+              raise SystemExit(f"Non-static source artifacts: {bad}")
+          print("SOURCE STATIC CONTRACT: PASS (48/48)")
+          PY
+
+      - name: Download exact accepted Trade-W prepared inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-3var-10-trade-input-trade_2000_2012-${{ inputs.original_run_id }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.original_run_id }}
+
+      - name: Verify exact model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/derived/panel_domestic_fin3_rate_diff.csv
+          test -f data/weights/W_trade_2000_2012.csv
+          test -f results/events/00_event_calendar.csv
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install diagnostic dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Rcpp
+            any::RcppArmadillo
+            any::stochvol
+            any::GIGrvg
+            any::MASS
+            any::dlm
+            any::snowfall
+
+      - name: Reconstruct exact tested static-block extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          src=Path(".github/workflows/10k_fixed_sg_staticblock_gibbs_diagnostic.yml")
+          lines=src.read_text().splitlines()
+          target="- name: Extend pinned threshtvp with static-block Gibbs sampler"
+
+          start=next((i for i,x in enumerate(lines) if x.strip()==target),None)
+          if start is None:
+              raise SystemExit("Missing tested static-block extension step")
+
+          run_line=None
+          for i in range(start+1,len(lines)):
+              if lines[i].startswith("      - name:"):
+                  break
+              if lines[i].strip()=="run: |":
+                  run_line=i
+                  break
+          if run_line is None:
+              raise SystemExit("Missing tested static-block run block")
+
+          body=[]
+          for i in range(run_line+1,len(lines)):
+              line=lines[i]
+              if line.startswith("      - name:"):
+                  break
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append("")
+              else:
+                  raise SystemExit(f"Unexpected indentation: {line!r}")
+
+          Path("/tmp/10r_extend_staticblock.sh").write_text(
+              "\n".join(body)+"\n"
+          )
+          PY
+
+          bash -n /tmp/10r_extend_staticblock.sh
+          bash /tmp/10r_extend_staticblock.sh
+
+          test -f threshtvp_src/R/MCMC_function.R
+          test "$(git -C threshtvp_src rev-parse HEAD)" = \
+            "${FIN3_THRESHTVP_BASE_SHA}"
+
+      - name: Apply proven integer storage-grid fix and reinstall package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          src="threshtvp_src/R/MCMC_function.R"
+
+          sha256sum "${src}" | tee /tmp/10r_mcmc_source_before.sha256
+
+          Rscript --vanilla R/74_patch_threshtvp_storage_grid.R "${src}"
+
+          sha256sum "${src}" | tee /tmp/10r_mcmc_source_after.sha256
+          test "$(cut -d' ' -f1 /tmp/10r_mcmc_source_before.sha256)" != \
+               "$(cut -d' ' -f1 /tmp/10r_mcmc_source_after.sha256)" || {
+            echo "::error::Storage patch did not change MCMC_function.R."
+            exit 1
+          }
+
+          grep -F 'nstore <- as.integer(round(thin*nsave))' "${src}" >/dev/null
+          grep -F 'thin_out <- round(seq(nburn,ntot,length.out = nstore))' \
+            "${src}" >/dev/null
+
+          ! grep -F 'thin_out <- round(seq(nburn,ntot,length.out = thin*nsave))' \
+            "${src}" >/dev/null
+          ! grep -F 'H_store <- matrix(NA,thin*nsave,T)' "${src}" >/dev/null
+          ! grep -F 'ALPHA_store <- array(NA,c(thin*nsave,T,K_))' \
+            "${src}" >/dev/null
+
+          R CMD INSTALL threshtvp_src
+
+      - name: Verify installed sampler and exact 10n storage arithmetic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla - <<'RS'
+          f <- get("MCMC_tvp", envir=asNamespace("threshtvp"))
+          z <- paste(deparse(body(f)),collapse="\n")
+
+          if (!grepl("nstore",z,fixed=TRUE)) {
+            stop("Installed MCMC_tvp lacks integer nstore patch")
+          }
+          if (!grepl("length.out = nstore",z,fixed=TRUE)) {
+            stop("Installed MCMC_tvp does not use nstore for storage grid")
+          }
+
+          burn <- 5000L
+          nsave <- 15000L
+          stored <- 1000L
+          thin <- (stored+1L)/nsave
+          nstore <- as.integer(round(thin*nsave))
+          thin_out <- round(seq(
+            burn,burn+nsave,length.out=nstore
+          ))
+
+          stopifnot(
+            nstore == 1001L,
+            length(thin_out) == 1001L,
+            length(unique(thin_out)) == 1001L,
+            thin_out[[1]] == burn,
+            thin_out[[length(thin_out)]] == burn+nsave
+          )
+
+          cat("INSTALLED STORAGE CONTRACT: PASS\n")
+          cat("raw storage rows:",nstore,"\n")
+          cat("boundary row: 1\n")
+          cat("strictly post-burn rows after dropping boundary:",nstore-1L,"\n")
+          RS
+
+          cat "${FIN3_10R_PATCH_MANIFEST}"
+
+      - name: Parse R69 and R70 before MCMC
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla -e 'parse(file="R/69_ttvp_recovery_chain.R")'
+          Rscript --vanilla -e 'parse(file="R/70_ttvp_recovery_summarize.R")'
+
+      - name: Run storage-fixed unrestricted synthetic recovery chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript --vanilla R/69_ttvp_recovery_chain.R
+
+      - name: Enforce strict 1000-draw unrestricted output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          out="results/10n_ttvp_recovery_parts/SYNTH_JP__paper_code__unrestricted/chain_${FIN3_CHAIN_ID}"
+
+          test -f "${out}/10n_chain.rds"
+          test -f "${out}/00_chain_manifest.csv"
+          test -f "${out}/01_chain_term_summary.csv"
+          test -f "${out}/02_chain_tvp_by_quarter.csv"
+          test -f "${out}/03_synthetic_gpr0_recovery.csv"
+
+          Rscript --vanilla - <<'RS'
+          chain <- Sys.getenv("FIN3_CHAIN_ID")
+          p <- file.path(
+            "results/10n_ttvp_recovery_parts",
+            "SYNTH_JP__paper_code__unrestricted",
+            paste0("chain_",chain),
+            "10n_chain.rds"
+          )
+          x <- readRDS(p)
+
+          # R69 has already machine-checked all seven retained posterior objects
+          # at exactly FIN3_STORED_PER_CHAIN.  Here we require the saved
+          # diagnostic object itself to identify the intended scenario.
+          stopifnot(
+            identical(x$case,"SYNTH_JP"),
+            identical(x$calibration,"paper_code"),
+            identical(x$mode,"unrestricted")
+          )
+          cat("UNRESTRICTED CHAIN OUTPUT CONTRACT: PASS\n")
+          RS
+
+      - name: Upload storage-fixed unrestricted chain
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10r-SYNTH_JP__paper_code__unrestricted-chain${{ matrix.chain }}-${{ github.run_id }}
+          path: |
+            results/10n_ttvp_recovery_parts/SYNTH_JP__paper_code__unrestricted/chain_${{ matrix.chain }}/
+            results/10r_storage_patch_manifest.csv
+          if-no-files-found: error
+          retention-days: 30
+
+  summarize:
+    needs: unrestricted
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      FIN3_10N_PARTS_ROOT: "posterior_parts"
+      FIN3_10N_SUMMARY_OUT: "results/10n_ttvp_recovery_audit"
+
+    steps:
+      - name: Checkout current R70
+        uses: actions/checkout@v4
+
+      - name: Download existing 48 static chains
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10n-*-${{ inputs.source_static_run_id }}
+          path: posterior_parts/static
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_static_run_id }}
+
+      - name: Download four 10r unrestricted chains
+        uses: actions/download-artifact@v4
+        with:
+          pattern: financial-3var-10r-SYNTH_JP__paper_code__unrestricted-chain*-${{ github.run_id }}
+          path: posterior_parts/unrestricted
+          merge-multiple: false
+
+      - name: Verify merged 52-chain contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ns="$(find posterior_parts/static -type f -name '10n_chain.rds' | wc -l | tr -d ' ')"
+          nu="$(find posterior_parts/unrestricted -type f -name '10n_chain.rds' | wc -l | tr -d ' ')"
+          nt="$(find posterior_parts -type f -name '10n_chain.rds' | wc -l | tr -d ' ')"
+
+          test "${ns}" = "48" || {
+            echo "::error::Expected 48 static RDS files; found ${ns}."
+            exit 1
+          }
+          test "${nu}" = "4" || {
+            echo "::error::Expected 4 unrestricted RDS files; found ${nu}."
+            exit 1
+          }
+          test "${nt}" = "52" || {
+            echo "::error::Expected 52 total RDS files; found ${nt}."
+            exit 1
+          }
+
+          echo "MERGED CONTRACT: 48 static + 4 storage-fixed unrestricted = 52 PASS"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+          use-public-rspm: true
+
+      - name: Install posterior diagnostics
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::posterior
+
+      - name: Run original full 10n scientific summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          Rscript --vanilla -e 'parse(file="R/70_ttvp_recovery_summarize.R")'
+          Rscript --vanilla R/70_ttvp_recovery_summarize.R
+
+          echo
+          echo "===== 10N SCIENTIFIC DECISION AFTER STORAGE FIX ====="
+          cat results/10n_ttvp_recovery_audit/09_decision.csv
+
+      - name: Enforce diagnostic-only gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+
+          p="results/10n_ttvp_recovery_audit/09_decision.csv"
+          d={r["Item"]:r["Value"] for r in csv.DictReader(open(p))}
+
+          if d.get("TechnicalStatus")!="PASS":
+              raise SystemExit("10n TechnicalStatus != PASS")
+          if d.get("FormalModelChanged")!="FALSE":
+              raise SystemExit("FormalModelChanged must remain FALSE")
+          if d.get("IRFAuthorized")!="FALSE":
+              raise SystemExit("IRFAuthorized must remain FALSE")
+
+          print("TechnicalStatus: PASS")
+          print("Decision:",d.get("Decision"))
+          print("FormalModelChanged: FALSE")
+          print("IRFAuthorized: FALSE")
+          PY
+
+      - name: Upload final storage-fixed 10n audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-3var-10r-full-10n-recovery-audit-${{ github.run_id }}
+          path: results/10n_ttvp_recovery_audit/
+          if-no-files-found: error
+          retention-days: 30
